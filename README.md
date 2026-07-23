@@ -4,7 +4,7 @@ FoxyDB is a dependency-free database server implemented in PHP 8.2 or newer. It 
 
 FoxyDB is an early server implementation. Test it with representative workloads and maintain backups before using it for important data.
 
-For SQLite-style deployment without a daemon or network connection, use the [`../serverless`](../serverless/README.md) embedded package. Embedded databases use a distinct marked bundle directory and must not be opened from the daemon's data directory.
+For SQLite-style deployment without a daemon or network connection, use the [`Minosuko/FoxyDB-serverless`](https://github.com/Minosuko/FoxyDB-serverless/README.md) embedded package. Embedded databases use a distinct marked bundle directory and must not be opened from the daemon's data directory.
 
 ## Features
 
