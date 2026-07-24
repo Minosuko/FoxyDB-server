@@ -222,6 +222,56 @@ final class Authentication
                     ['kind' => 'primary', 'name' => 'primary', 'columns' => ['metric_name']],
                 ],
             ],
+            'roles' => [
+                'columns' => [
+                    ['name' => 'role_name', 'type' => 'VARCHAR', 'length' => 64, 'nullable' => false],
+                    ['name' => 'role_id', 'type' => 'UUID', 'nullable' => false, 'default' => ['expression' => 'uuid']],
+                    ['name' => 'created_at', 'type' => 'TIMESTAMP', 'nullable' => false, 'default' => ['expression' => 'current_timestamp']],
+                ],
+                'constraints' => [
+                    ['kind' => 'primary', 'name' => 'primary', 'columns' => ['role_name']],
+                    ['kind' => 'unique', 'name' => 'uq_role_id', 'columns' => ['role_id']],
+                ],
+            ],
+            'policies' => [
+                'columns' => [
+                    ['name' => 'policy_name', 'type' => 'VARCHAR', 'length' => 64, 'nullable' => false],
+                    ['name' => 'database_name', 'type' => 'VARCHAR', 'length' => 64, 'nullable' => false],
+                    ['name' => 'table_name', 'type' => 'VARCHAR', 'length' => 64, 'nullable' => false],
+                    ['name' => 'operation', 'type' => 'VARCHAR', 'length' => 16, 'nullable' => false],
+                    ['name' => 'expression_sql', 'type' => 'TEXT', 'nullable' => true],
+                    ['name' => 'created_at', 'type' => 'TIMESTAMP', 'nullable' => false, 'default' => ['expression' => 'current_timestamp']],
+                ],
+                'constraints' => [
+                    ['kind' => 'primary', 'name' => 'primary', 'columns' => ['policy_name', 'database_name', 'table_name']],
+                    ['kind' => 'index', 'name' => 'idx_policy_table', 'columns' => ['database_name', 'table_name']],
+                ],
+            ],
+            'replication_log' => [
+                'columns' => [
+                    ['name' => 'log_id', 'type' => 'BIGINT', 'nullable' => false, 'auto_increment' => true],
+                    ['name' => 'logged_at', 'type' => 'TIMESTAMP', 'nullable' => false, 'default' => ['expression' => 'current_timestamp']],
+                    ['name' => 'source_database', 'type' => 'VARCHAR', 'length' => 64, 'nullable' => false],
+                    ['name' => 'source_table', 'type' => 'VARCHAR', 'length' => 64, 'nullable' => false],
+                    ['name' => 'change_type', 'type' => 'VARCHAR', 'length' => 16, 'nullable' => false],
+                    ['name' => 'change_sql', 'type' => 'LONGTEXT', 'nullable' => false],
+                    ['name' => 'applied', 'type' => 'BOOLEAN', 'nullable' => false, 'default' => false],
+                ],
+                'constraints' => [
+                    ['kind' => 'primary', 'name' => 'primary', 'columns' => ['log_id']],
+                ],
+            ],
+            'role_assignments' => [
+                'columns' => [
+                    ['name' => 'username', 'type' => 'VARCHAR', 'length' => 64, 'nullable' => false],
+                    ['name' => 'role_id', 'type' => 'UUID', 'nullable' => false],
+                    ['name' => 'granted_at', 'type' => 'TIMESTAMP', 'nullable' => false, 'default' => ['expression' => 'current_timestamp']],
+                ],
+                'constraints' => [
+                    ['kind' => 'primary', 'name' => 'primary', 'columns' => ['username', 'role_id']],
+                    ['kind' => 'index', 'name' => 'idx_ra_role', 'columns' => ['role_id']],
+                ],
+            ],
             'sys_config' => [
                 'columns' => [
                     ['name' => 'variable_name', 'type' => 'VARCHAR', 'length' => 128, 'nullable' => false],
@@ -367,7 +417,9 @@ final class Authentication
     private function synchronizeAuthorizationCaches(): void
     {
         $revision = $this->storage->tableRevision(self::SYSTEM_DATABASE, 'users_schema')
-            . ':' . $this->storage->tableRevision(self::SYSTEM_DATABASE, 'privileges');
+            . ':' . $this->storage->tableRevision(self::SYSTEM_DATABASE, 'privileges')
+            . ':' . $this->storage->tableRevision(self::SYSTEM_DATABASE, 'roles')
+            . ':' . $this->storage->tableRevision(self::SYSTEM_DATABASE, 'role_assignments');
         if ($revision === $this->authorizationRevision) {
             return;
         }

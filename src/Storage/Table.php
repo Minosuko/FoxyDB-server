@@ -25,6 +25,7 @@ final class Table
     private bool $mutationNotified = false;
     private ?array $metadataCache = null;
     private array $indexStores = [];
+    private ?\Closure $undoCallback = null;
 
     public function __construct(
         private readonly string $path,
@@ -50,6 +51,11 @@ final class Table
         } finally {
             $this->releaseLock($lock);
         }
+    }
+
+    public function setUndoCallback(?\Closure $callback): void
+    {
+        $this->undoCallback = $callback;
     }
 
     public static function create(string $path, array $schema, Config $config): void
@@ -513,6 +519,35 @@ final class Table
         }
     }
 
+    public function rollbackEntries(array $entries): void
+    {
+        if ($entries === []) {
+            return;
+        }
+        $lock = $this->acquireLock(LOCK_EX);
+        try {
+            $this->recoverLocked();
+            $schema = $this->loadMetadata();
+            FileSystem::atomicWrite($this->dirtyPath(), "dirty\n", $this->config->syncWrites);
+            foreach (array_reverse($entries) as $entry) {
+                $rowId = $entry['row_id'];
+                if ($entry['old_slot_bytes'] === null) {
+                    $current = $this->readSlotLocked($schema, $rowId);
+                    if ($current !== null) {
+                        $delSlot = $this->encodeSlot(0, 0, $current['generation'] + 1, self::SLOT_DELETED);
+                        $this->writeSlotLocked($schema, $rowId, $delSlot);
+                    }
+                } else {
+                    $this->writeSlotLocked($schema, $rowId, $entry['old_slot_bytes']);
+                }
+            }
+            $this->rebuildIndexesLocked($schema);
+            $this->finishMutationLocked();
+        } finally {
+            $this->releaseLock($lock);
+        }
+    }
+
     public function createIndex(string $name, array $columns, bool $unique, bool $ifNotExists = false): void
     {
         $this->beginMutation();
@@ -730,6 +765,310 @@ final class Table
         }
     }
 
+    public function alterSchema(array $actions): array
+    {
+        $this->beginMutation();
+        $lock = $this->acquireLock(LOCK_EX);
+        try {
+            $this->recoverLocked();
+            $schema = $this->loadMetadata(true);
+            $newSchema = $schema;
+            $columnRequiresRebuild = false;
+
+            foreach ($actions as $action) {
+                $kind = $action['kind'];
+                if ($kind === 'set_auto_increment') {
+                    $autoValue = (int) $action['value'];
+                    [$nextRow, $nextAuto] = $this->readSequenceLocked($schema);
+                    $this->writeSequence($nextRow, $autoValue);
+                    continue;
+                }
+                if ($kind === 'set_collation') {
+                    $schema['collation'] = $action['value'];
+                    $this->storeMetadata($schema);
+                    continue;
+                }
+                if ($kind === 'rename_column') {
+                    $this->validateColumnExists($schema, $action['old_name']);
+                    $newName = TypeSystem::identifier($action['new_name']);
+                    $this->assertColumnNameUnique($newSchema, $newName, $action['old_name']);
+                    foreach ($newSchema['columns'] as $i => $col) {
+                        if ($col['name'] === $action['old_name']) {
+                            $newSchema['columns'][$i]['name'] = $newName;
+                            break;
+                        }
+                    }
+                    if ($newSchema['auto_increment_column'] === $action['old_name']) {
+                        $newSchema['auto_increment_column'] = $newName;
+                    }
+                    $newSchema['primary_key'] = array_map(
+                        static fn(string $pk): string => $pk === $action['old_name'] ? $newName : $pk,
+                        $newSchema['primary_key'],
+                    );
+                    foreach ($newSchema['indexes'] as &$index) {
+                        $index['columns'] = array_map(
+                            static fn(string $col): string => $col === $action['old_name'] ? $newName : $col,
+                            $index['columns'],
+                        );
+                    }
+                    unset($index);
+                    $schema = $newSchema;
+                    $this->storeMetadata($schema);
+                    $this->notifyMutation();
+                    continue;
+                }
+                if ($kind === 'rename_table') {
+                    $newName = TypeSystem::identifier($action['new_name']);
+                    $schema['name'] = $newName;
+                    $this->storeMetadata($schema);
+                    $this->notifyMutation();
+                    continue;
+                }
+                if ($kind === 'rename_index') {
+                    $this->validateIndexExists($schema, $action['old_name']);
+                    $newName = TypeSystem::identifier($action['new_name']);
+                    if (isset($newSchema['indexes'][$newName]) && $newName !== $action['old_name']) {
+                        throw new FoxyException("Index {$newName} already exists.", 'INDEX_EXISTS');
+                    }
+                    $newSchema['indexes'][$newName] = $newSchema['indexes'][$action['old_name']];
+                    $newSchema['indexes'][$newName]['name'] = $newName;
+                    unset($newSchema['indexes'][$action['old_name']]);
+                    $schema = $newSchema;
+                    $this->storeMetadata($schema);
+                    $this->notifyMutation();
+                    continue;
+                }
+                if ($kind === 'add_index' || $kind === 'add_primary') {
+                    $name = $kind === 'add_primary' ? 'primary' : TypeSystem::identifier($action['name']);
+                    $columns = $action['columns'];
+                    $unique = $kind === 'add_primary' || ($action['unique'] ?? false);
+                    if (isset($newSchema['indexes'][$name])) {
+                        throw new FoxyException("Index {$name} already exists.", 'INDEX_EXISTS');
+                    }
+                    $index = [
+                        'name' => $name,
+                        'columns' => $columns,
+                        'unique' => $unique,
+                        'primary' => $kind === 'add_primary',
+                    ];
+                    $this->types->validateIndex($index, $newSchema);
+                    $newSchema['indexes'][$name] = $index;
+                    if ($kind === 'add_primary') {
+                        $newSchema['primary_key'] = $columns;
+                        foreach ($newSchema['columns'] as &$col) {
+                            if (in_array($col['name'], $columns, true)) {
+                                $col['nullable'] = false;
+                            }
+                        }
+                        unset($col);
+                    }
+                    $schema = $newSchema;
+                    $this->storeMetadata($schema);
+                    $store = $this->indexStore($schema);
+                    $store->prepare([$name]);
+                    foreach ($this->iterateRowsLocked($schema, null) as $entry) {
+                        $values = $this->indexValues($index, $entry['values']);
+                        if ($unique && IndexStore::containsNull($values)) {
+                            continue;
+                        }
+                        $store->append($name, IndexStore::key($values), $entry['id'], true);
+                    }
+                    if ($unique) {
+                        $store->assertUnique($name);
+                    }
+                    $this->notifyMutation();
+                    continue;
+                }
+                if ($kind === 'drop_index' || $kind === 'drop_primary' || $kind === 'drop_constraint') {
+                    $name = $kind === 'drop_primary' ? 'primary' : TypeSystem::identifier($action['name']);
+                    $this->validateIndexExists($schema, $name);
+                    if (($newSchema['indexes'][$name]['primary'] ?? false) === true) {
+                        $newSchema['primary_key'] = [];
+                    }
+                    unset($newSchema['indexes'][$name]);
+                    $schema = $newSchema;
+                    $this->storeMetadata($schema);
+                    FileSystem::removeTree(
+                        $this->generationPath($schema) . DIRECTORY_SEPARATOR . 'indexes' . DIRECTORY_SEPARATOR . $name,
+                    );
+                    $this->notifyMutation();
+                    continue;
+                }
+                if ($kind === 'add_column') {
+                    $col = $action['column'];
+                    $col['name'] = TypeSystem::identifier($col['name']);
+                    $this->assertColumnNameUnique($newSchema, $col['name']);
+                    $this->types->compileColumn($col, $newSchema);
+                    $newSchema['columns'][] = $col;
+                    $columnRequiresRebuild = true;
+                    continue;
+                }
+                if ($kind === 'drop_column') {
+                    $colName = TypeSystem::identifier($action['name']);
+                    $this->validateColumnExists($schema, $colName);
+                    if ($schema['auto_increment_column'] === $colName) {
+                        throw new FoxyException('An AUTO_INCREMENT column cannot be dropped.', 'SCHEMA_ERROR');
+                    }
+                    foreach ($newSchema['indexes'] as $indexName => $index) {
+                        if (in_array($colName, $index['columns'], true)) {
+                            throw new FoxyException(
+                                "Column {$colName} is referenced by index {$indexName}.", 'SCHEMA_ERROR',
+                            );
+                        }
+                    }
+                    $newSchema['columns'] = array_values(array_filter(
+                        $newSchema['columns'],
+                        static fn(array $c): bool => $c['name'] !== $colName,
+                    ));
+                    $newSchema['primary_key'] = array_values(array_filter(
+                        $newSchema['primary_key'],
+                        static fn(string $pk): bool => $pk !== $colName,
+                    ));
+                    $columnRequiresRebuild = true;
+                    continue;
+                }
+                if ($kind === 'modify_column' || $kind === 'change_column') {
+                    $col = $action['column'];
+                    $col['name'] = TypeSystem::identifier($col['name']);
+                    $this->validateColumnExists($schema, $col['name']);
+                    if (count($newSchema['columns']) > 1024) {
+                        throw new FoxyException('The table already has the maximum number of columns.', 'SCHEMA_ERROR');
+                    }
+                    $this->types->compileColumn($col, $newSchema);
+                    if ($newSchema['auto_increment_column'] === $col['name']
+                        && !($col['auto_increment'] ?? false)) {
+                        throw new FoxyException(
+                            'An AUTO_INCREMENT column must retain AUTO_INCREMENT.', 'SCHEMA_ERROR',
+                        );
+                    }
+                    foreach ($newSchema['columns'] as $i => $existing) {
+                        if ($existing['name'] === $col['name']) {
+                            $col['auto_increment'] = $existing['auto_increment'] ?? $col['auto_increment'] ?? false;
+                            $col['primary'] = ($col['auto_increment'] ?? false) || $col['name'] === $newSchema['auto_increment_column'];
+                            $newSchema['columns'][$i] = $col;
+                            break;
+                        }
+                    }
+                    $columnRequiresRebuild = true;
+                    continue;
+                }
+                throw new FoxyException('Unsupported ALTER TABLE action.', 'SQL_UNSUPPORTED');
+            }
+
+            if ($columnRequiresRebuild) {
+                $newSchema = $this->types->compileSchema($newSchema['name'], [
+                    'columns' => $newSchema['columns'],
+                    'constraints' => $this->indexesToConstraints($newSchema),
+                ]);
+                $newSchema['table_id'] = $schema['table_id'];
+                $newSchema['active_generation'] = $schema['active_generation'];
+                $newSchema['previous_generation'] = $schema['previous_generation'];
+                $newSchema['collation'] = $schema['collation'] ?? null;
+                $this->validateMetadata($newSchema);
+
+                $oldGeneration = $this->generationPath($schema);
+                $obsoleteGeneration = $schema['previous_generation'] ?? null;
+                $number = $this->nextGenerationNumber();
+                $temporary = $this->path . DIRECTORY_SEPARATOR . self::generationName($number) . '.compacting';
+                $published = $this->path . DIRECTORY_SEPARATOR . self::generationName($number);
+                FileSystem::removeTree($temporary);
+                self::initializeGeneration($temporary, array_keys($newSchema['indexes']), $this->config);
+                $referenceDirectory = $this->path . DIRECTORY_SEPARATOR . '.chunk-refs-' . bin2hex(random_bytes(5));
+                FileSystem::ensureDirectory($referenceDirectory);
+                $rowsCopied = 0;
+                try {
+                    $newData = @fopen($temporary . DIRECTORY_SEPARATOR . 'rows.fdb', 'c+b');
+                    $newSlots = @fopen($temporary . DIRECTORY_SEPARATOR . 'rows.fdx', 'c+b');
+                    if ($newData === false || $newSlots === false) {
+                        if (is_resource($newData)) {
+                            fclose($newData);
+                        }
+                        if (is_resource($newSlots)) {
+                            fclose($newSlots);
+                        }
+                        throw new FoxyException('Unable to create migrated table files.', 'STORAGE_IO');
+                    }
+                    $newIndexes = new IndexStore($temporary . DIRECTORY_SEPARATOR . 'indexes', $this->config);
+                    $newIndexes->prepare(array_keys($newSchema['indexes']));
+                    try {
+                        foreach ($this->iterateRowsLocked($schema, null, true) as $entry) {
+                            $migratedRow = [];
+                            foreach ($newSchema['columns'] as $newCol) {
+                                $newName = $newCol['name'];
+                                $oldCol = $this->findColumn($schema, $newName);
+                                if ($oldCol !== null && array_key_exists($newName, $entry['values'])) {
+                                    $value = $entry['values'][$newName];
+                                    $migratedRow[$newName] = $this->types->coerce($value, $newCol);
+                                } else {
+                                    if ($newCol['nullable']) {
+                                        $migratedRow[$newName] = null;
+                                    } elseif (array_key_exists('default', $newCol)) {
+                                        $migratedRow[$newName] = $newCol['default'];
+                                    } else {
+                                        throw new FoxyException(
+                                            "New column {$newName} requires a default or must be nullable.", 'SCHEMA_ERROR',
+                                        );
+                                    }
+                                }
+                            }
+                            $encodedRow = $this->encodeRecord($newSchema, $entry['id'], $migratedRow);
+                            fseek($newData, 0, SEEK_END);
+                            $offset = ftell($newData);
+                            if ($offset === false) {
+                                throw new FoxyException('Unable to locate migrated data offset.', 'STORAGE_IO');
+                            }
+                            FileSystem::writeAll($newData, $encodedRow);
+                            $slot = $this->encodeSlot($offset, strlen($encodedRow), $entry['generation'], self::SLOT_ACTIVE);
+                            $this->writeSlotToStream($newSlots, $entry['id'], $slot);
+                            foreach ($entry['encoded'] as $encodedValue) {
+                                $this->chunks->recordReferences($encodedValue, $referenceDirectory);
+                            }
+                            foreach ($this->indexEntries($newSchema, $migratedRow) as $indexName => $indexEntry) {
+                                if ($indexEntry['skip']) {
+                                    continue;
+                                }
+                                $newIndexes->append($indexName, $indexEntry['key'], $entry['id'], true);
+                            }
+                            $rowsCopied++;
+                        }
+                        FileSystem::flush($newData, $this->config->syncWrites);
+                        FileSystem::flush($newSlots, $this->config->syncWrites);
+                    } finally {
+                        fclose($newData);
+                        fclose($newSlots);
+                    }
+                    if (!@rename($temporary, $published)) {
+                        throw new FoxyException('Unable to publish migrated generation.', 'STORAGE_IO');
+                    }
+                    $newSchema['active_generation'] = $number;
+                    $newSchema['previous_generation'] = $schema['active_generation'];
+                    $this->storeMetadata($newSchema);
+                    $this->notifyMutation();
+                    $chunksRemoved = $this->chunks->garbageCollect($referenceDirectory);
+                    if ($obsoleteGeneration !== null
+                        && (int) $obsoleteGeneration !== (int) $newSchema['previous_generation']) {
+                        FileSystem::removeTree(
+                            $this->path . DIRECTORY_SEPARATOR . self::generationName((int) $obsoleteGeneration),
+                        );
+                    }
+                } catch (\Throwable $exception) {
+                    if (is_dir($temporary)) {
+                        FileSystem::removeTree($temporary);
+                    }
+                    throw $exception;
+                } finally {
+                    FileSystem::removeTree($referenceDirectory);
+                }
+                return ['rows_migrated' => $rowsCopied, 'chunks_removed' => $chunksRemoved];
+            }
+
+            $this->notifyMutation();
+            return ['status' => 'ok'];
+        } finally {
+            $this->releaseLock($lock);
+        }
+    }
+
     public function analyze(): array
     {
         $lock = $this->acquireLock(LOCK_EX);
@@ -867,6 +1206,7 @@ final class Table
     {
         $oldSlot = $this->readSlotLocked($schema, $rowId);
         $generation = ($oldSlot['generation'] ?? 0) + 1;
+        $undoOldSlotBytes = $this->undoCallback !== null ? $this->readRawSlotBytesLocked($schema, $rowId) : null;
         FileSystem::atomicWrite($this->dirtyPath(), "dirty\n", $this->config->syncWrites);
         $record = $preparedRecord ?? $this->encodeRecord($schema, $rowId, $row);
         $dataPath = $this->generationPath($schema) . DIRECTORY_SEPARATOR . 'rows.fdb';
@@ -895,6 +1235,9 @@ final class Table
             $this->rebuildIndexesLocked($schema);
         }
         $this->finishMutationLocked();
+        if ($this->undoCallback !== null) {
+            ($this->undoCallback)($rowId, $undoOldSlotBytes, $oldRow, $row);
+        }
     }
 
     private function deleteRowLocked(array $schema, int $rowId, array $oldRow): void
@@ -903,6 +1246,7 @@ final class Table
         if ($oldSlot === null || $oldSlot['status'] !== self::SLOT_ACTIVE) {
             return;
         }
+        $undoOldSlotBytes = $this->undoCallback !== null ? $this->readRawSlotBytesLocked($schema, $rowId) : null;
         FileSystem::atomicWrite($this->dirtyPath(), "dirty\n", $this->config->syncWrites);
         $slot = $this->encodeSlot(0, 0, $oldSlot['generation'] + 1, self::SLOT_DELETED);
         $this->commitSlotLocked($schema, $rowId, $slot);
@@ -912,6 +1256,9 @@ final class Table
             $this->rebuildIndexesLocked($schema);
         }
         $this->finishMutationLocked();
+        if ($this->undoCallback !== null) {
+            ($this->undoCallback)($rowId, $undoOldSlotBytes, $oldRow, null);
+        }
     }
 
     private function commitSlotLocked(array $schema, int $rowId, string $slot): void
@@ -1247,6 +1594,33 @@ final class Table
         }
         try {
             return $this->readSlotFromStream($stream, $rowId);
+        } finally {
+            fclose($stream);
+        }
+    }
+
+    private function readRawSlotBytesLocked(array $schema, int $rowId): ?string
+    {
+        $generation = $this->generationPath($schema);
+        $stream = @fopen($generation . DIRECTORY_SEPARATOR . 'rows.fdx', 'rb');
+        if ($stream === false) {
+            throw new FoxyException('Unable to open row slots.', 'STORAGE_IO');
+        }
+        try {
+            $statistics = fstat($stream);
+            $streamBytes = (int) ($statistics['size'] ?? 0);
+            $offset = ($rowId - 1) * self::SLOT_BYTES;
+            if ($offset < 0 || $offset + self::SLOT_BYTES > $streamBytes) {
+                return null;
+            }
+            if (fseek($stream, $offset) !== 0) {
+                throw new FoxyException('Unable to seek row slot.', 'STORAGE_IO');
+            }
+            $slot = FileSystem::readExact($stream, self::SLOT_BYTES) ?? '';
+            if ($slot === str_repeat("\0", self::SLOT_BYTES)) {
+                return null;
+            }
+            return $slot;
         } finally {
             fclose($stream);
         }
@@ -1702,6 +2076,54 @@ final class Table
         } finally {
             fclose($stream);
         }
+    }
+
+    private function findColumn(array $schema, string $name): ?array
+    {
+        foreach ($schema['columns'] as $column) {
+            if ($column['name'] === $name) {
+                return $column;
+            }
+        }
+        return null;
+    }
+
+    private function validateColumnExists(array $schema, string $name): void
+    {
+        if ($this->findColumn($schema, $name) === null) {
+            throw new FoxyException("Column {$name} does not exist.", 'UNKNOWN_COLUMN');
+        }
+    }
+
+    private function validateIndexExists(array $schema, string $name): void
+    {
+        if (!isset($schema['indexes'][$name])) {
+            throw new FoxyException("Index {$name} does not exist.", 'INDEX_NOT_FOUND');
+        }
+    }
+
+    private function assertColumnNameUnique(array $schema, string $name, ?string $skipName = null): void
+    {
+        foreach ($schema['columns'] as $column) {
+            if ($column['name'] === $name && $column['name'] !== $skipName) {
+                throw new FoxyException("Column {$name} already exists.", 'SCHEMA_ERROR');
+            }
+        }
+    }
+
+    private function indexesToConstraints(array $schema): array
+    {
+        $constraints = [];
+        foreach ($schema['indexes'] ?? [] as $index) {
+            if ($index['primary']) {
+                $constraints[] = ['kind' => 'primary', 'name' => 'primary', 'columns' => $index['columns']];
+            } elseif ($index['unique']) {
+                $constraints[] = ['kind' => 'unique', 'name' => $index['name'], 'columns' => $index['columns']];
+            } else {
+                $constraints[] = ['kind' => 'index', 'name' => $index['name'], 'columns' => $index['columns']];
+            }
+        }
+        return $constraints;
     }
 
     private function indexesComplete(array $schema): bool

@@ -170,6 +170,71 @@ final class TypeSystem
         ];
     }
 
+    public function compileColumn(array $column, array $existingSchema): void
+    {
+        $name = self::identifier((string) ($column['name'] ?? ''));
+        $type = strtoupper((string) ($column['type'] ?? ''));
+        if (!in_array($type, self::TYPES, true)) {
+            throw new FoxyException("Unsupported data type: {$type}", 'SCHEMA_ERROR');
+        }
+        $length = isset($column['length']) ? (int) $column['length'] : null;
+        if (in_array($type, ['VARCHAR', 'BINARY'], true)) {
+            $length ??= $type === 'VARCHAR' ? 255 : null;
+            if ($length === null || $length < 1 || $length > 65_535) {
+                throw new FoxyException("{$type} requires a length from 1 to 65535.", 'SCHEMA_ERROR');
+            }
+        } elseif ($length !== null) {
+            throw new FoxyException("{$type} does not accept a length.", 'SCHEMA_ERROR');
+        }
+        $autoIncrement = (bool) ($column['auto_increment'] ?? false);
+        if ($autoIncrement) {
+            $hasExistingAuto = false;
+            foreach ($existingSchema['columns'] as $existing) {
+                if (($existing['auto_increment'] ?? false) === true) {
+                    $hasExistingAuto = true;
+                    break;
+                }
+            }
+            if ($hasExistingAuto) {
+                throw new FoxyException('Only one AUTO_INCREMENT column is allowed.', 'SCHEMA_ERROR');
+            }
+            if (!in_array($type, ['TINYINT', 'INT', 'BIGINT'], true)) {
+                throw new FoxyException('AUTO_INCREMENT requires an integer column.', 'SCHEMA_ERROR');
+            }
+        }
+        if (array_key_exists('default', $column)) {
+            $this->compileDefault($column['default'], [
+                'name' => $name, 'type' => $type, 'length' => $length, 'nullable' => true,
+            ]);
+        }
+    }
+
+    public function validateIndex(array $index, array $schema): void
+    {
+        $columns = $index['columns'];
+        if ($columns === [] || count(array_unique($columns)) !== count($columns)) {
+            throw new FoxyException('An index requires distinct columns.', 'SCHEMA_ERROR');
+        }
+        $columnMap = [];
+        foreach ($schema['columns'] as $column) {
+            $columnMap[$column['name']] = $column;
+        }
+        foreach ($columns as $colName) {
+            if (!isset($columnMap[$colName])) {
+                throw new FoxyException("Unknown indexed column: {$colName}", 'SCHEMA_ERROR');
+            }
+            if (in_array($columnMap[$colName]['type'], ['TEXT', 'LONGTEXT', 'BLOB'], true)) {
+                throw new FoxyException("Column {$colName} cannot be indexed.", 'SCHEMA_ERROR');
+            }
+        }
+        if (($index['primary'] ?? false) === true) {
+            if ($schema['primary_key'] !== [] && $schema['primary_key'] !== $columns) {
+                throw new FoxyException('Only one primary key is allowed.', 'SCHEMA_ERROR');
+            }
+        }
+        $this->assertIndexWidth($index, $columnMap);
+    }
+
     public function prepareInsert(array $input, array $schema, int $nextAuto): array
     {
         $input = array_change_key_case($input, CASE_LOWER);
@@ -285,15 +350,6 @@ final class TypeSystem
             return new BinaryValue($bytes);
         }
         return $value;
-    }
-
-    public function validateIndex(array $index, array $schema): void
-    {
-        $columns = [];
-        foreach ($schema['columns'] as $column) {
-            $columns[$column['name']] = $column;
-        }
-        $this->assertIndexWidth($index, $columns);
     }
 
     public function compare(mixed $left, mixed $right): int

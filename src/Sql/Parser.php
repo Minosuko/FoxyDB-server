@@ -74,6 +74,11 @@ final class Parser
             $this->matchKeyword('CHECKSUM') => $this->parseCheckTable(),
             $this->matchKeyword('DEFRAGMENT') => $this->parseTableMaintenance('defragment'),
             $this->matchKeyword('FLUSH') => $this->parseFlush(),
+            $this->matchKeyword('GRANT') => $this->parseGrant(),
+            $this->matchKeyword('REVOKE') => $this->parseRevoke(),
+            $this->matchKeyword('BEGIN') => $this->parseBegin(),
+            $this->matchKeyword('COMMIT') => $this->parseEndKeyword('commit'),
+            $this->matchKeyword('ROLLBACK') => $this->parseEndKeyword('rollback'),
             default => throw $this->error('Unsupported SQL statement.'),
         };
 
@@ -103,6 +108,12 @@ final class Parser
         }
         if ($this->matchKeyword('TABLE')) {
             return $this->parseCreateTable();
+        }
+        if ($this->matchKeyword('ROLE')) {
+            return ['type' => 'create_role', 'role' => $this->identifier()];
+        }
+        if ($this->matchKeyword('POLICY')) {
+            return $this->parseCreatePolicy();
         }
 
         $unique = $this->matchKeyword('UNIQUE');
@@ -285,7 +296,13 @@ final class Parser
                 'if_exists' => $ifExists,
             ];
         }
-        throw $this->error('Expected DATABASE, TABLE, or INDEX after DROP.');
+        if ($this->matchKeyword('ROLE')) {
+            return ['type' => 'drop_role', 'role' => $this->identifier()];
+        }
+        if ($this->matchKeyword('POLICY')) {
+            return $this->parseDropPolicy();
+        }
+        throw $this->error('Expected DATABASE, TABLE, INDEX, ROLE, or POLICY after DROP.');
     }
 
     private function parseShow(): array
@@ -373,14 +390,22 @@ final class Parser
             $projections[] = ['kind' => 'all'];
         } else {
             do {
-                if ($this->peekKeyword('COUNT') && $this->peekSymbol('(', 1)) {
-                    $this->advance();
+                $upper = $this->current()->type === 'IDENTIFIER'
+                    ? strtoupper((string) $this->current()->value) : '';
+                if (in_array($upper, ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'], true)
+                    && $this->isFunctionStart()) {
+                    $func = strtolower($this->identifier());
                     $this->expectSymbol('(');
-                    $this->expectSymbol('*');
+                    $column = $this->matchSymbol('*') ? null : $this->qualifiedIdentifier();
                     $this->expectSymbol(')');
-                    $projection = ['kind' => 'count', 'alias' => 'count'];
+                    $alias = $column !== null ? $func . '_' . $column : $func;
+                    $projection = ['kind' => $func, 'column' => $column, 'alias' => $alias];
+                } elseif ($this->current()->type === 'NUMBER' || $this->current()->type === 'STRING') {
+                    $value = $this->parseValueNode(false);
+                    $col = (string)($value['value'] ?? '?');
+                    $projection = ['kind' => 'value', 'value' => $value, 'alias' => $col];
                 } else {
-                    $column = $this->identifier();
+                    $column = $this->qualifiedIdentifier();
                     $projection = ['kind' => 'column', 'column' => $column, 'alias' => $column];
                 }
                 if ($this->matchKeyword('AS')) {
@@ -390,8 +415,58 @@ final class Parser
             } while ($this->matchSymbol(','));
         }
         $this->expectKeyword('FROM');
-        $table = $this->qualifiedIdentifier();
+        $joins = [];
+        do {
+            $table = $this->qualifiedIdentifier();
+            $alias = null;
+            if ($this->matchKeyword('AS')) {
+                $alias = $this->identifier();
+            } elseif ($this->current()->type === 'IDENTIFIER'
+                && !in_array(strtoupper($this->current()->value), [
+                    'WHERE', 'ORDER', 'LIMIT', 'OFFSET', 'GROUP', 'HAVING',
+                    'INNER', 'LEFT', 'RIGHT', 'JOIN', 'CROSS', 'OUTER', 'ON',
+                    'AND', 'OR', 'NOT', 'IN', 'IS', 'LIKE', 'BETWEEN', 'EXISTS',
+                    'GROUP', 'HAVING', 'SUM', 'AVG', 'MIN', 'MAX', 'COUNT',
+                ], true)) {
+                $alias = $this->identifier();
+            }
+            $joins[] = ['table' => $table, 'alias' => $alias];
+        } while ($this->matchSymbol(','));
+
+        $left = false;
+        $right = false;
+        while (($this->matchKeyword('INNER') || $this->matchKeyword('CROSS'))
+            || ($left = $this->matchKeyword('LEFT'))
+            || ($right = $this->matchKeyword('RIGHT'))) {
+            if ($left || $right) {
+                $this->matchKeyword('OUTER');
+            }
+            $this->expectKeyword('JOIN');
+            $table = $this->qualifiedIdentifier();
+            $alias = null;
+            if ($this->matchKeyword('AS')) {
+                $alias = $this->identifier();
+            } elseif ($this->current()->type === 'IDENTIFIER'
+                && !in_array(strtoupper($this->current()->value), [
+                    'ON', 'INNER', 'LEFT', 'RIGHT', 'JOIN', 'CROSS', 'OUTER',
+                    'WHERE', 'ORDER', 'LIMIT', 'OFFSET', 'GROUP', 'HAVING',
+                ], true)) {
+                $alias = $this->identifier();
+            }
+            $this->expectKeyword('ON');
+            $on = $this->parseExpression();
+            $joinType = $right ? 'right' : ($left ? 'left' : 'inner');
+            $joins[] = ['table' => $table, 'alias' => $alias, 'join' => $joinType, 'on' => $on];
+        }
         $where = $this->matchKeyword('WHERE') ? $this->parseExpression() : null;
+        $group = [];
+        if ($this->matchKeyword('GROUP')) {
+            $this->expectKeyword('BY');
+            do {
+                $group[] = $this->qualifiedIdentifier();
+            } while ($this->matchSymbol(','));
+        }
+        $having = $this->matchKeyword('HAVING') ? $this->parseExpression() : null;
         $order = [];
         if ($this->matchKeyword('ORDER')) {
             $this->expectKeyword('BY');
@@ -423,11 +498,16 @@ final class Parser
             }
             $offset = $this->parseValueNode(false);
         }
+        $from = $joins;
+        $table = count($from) === 1 && !array_key_exists('join', $from[0]) ? $from[0]['table'] : null;
         return [
             'type' => 'select',
             'table' => $table,
+            'from' => $from,
             'projections' => $projections,
             'where' => $where,
+            'group' => $group,
+            'having' => $having,
             'order' => $order,
             'limit' => $limit,
             'offset' => $offset,
@@ -475,15 +555,93 @@ final class Parser
     {
         $this->expectKeyword('TABLE');
         $table = $this->qualifiedIdentifier();
-        if ($this->matchKeyword('AUTO_INCREMENT')) {
-            $this->expectSymbol('=');
-            return ['type' => 'set_auto_increment', 'table' => $table, 'value' => $this->parseValueNode(false)];
-        }
-        if ($this->matchKeyword('COLLATE') || $this->matchKeyword('COLLATION')) {
-            $value = $this->identifier();
-            return ['type' => 'set_collation', 'table' => $table, 'value' => $value];
-        }
-        throw $this->error('Expected AUTO_INCREMENT or COLLATE after ALTER TABLE.');
+        $actions = [];
+        do {
+            if ($this->matchKeyword('AUTO_INCREMENT')) {
+                $this->expectSymbol('=');
+                $actions[] = ['kind' => 'set_auto_increment', 'value' => $this->parseValueNode(false)];
+                continue;
+            }
+            if ($this->matchKeyword('COLLATE') || $this->matchKeyword('COLLATION')) {
+                $actions[] = ['kind' => 'set_collation', 'value' => $this->identifier()];
+                continue;
+            }
+            if ($this->matchKeyword('ADD')) {
+                $this->matchKeyword('COLUMN');
+                if ($this->matchKeyword('CONSTRAINT')) {
+                    $constraint = $this->parseTableConstraint();
+                    $actions[] = ['kind' => 'add_constraint', 'constraint' => $constraint];
+                } elseif ($this->matchKeyword('INDEX') || $this->matchKeyword('KEY')) {
+                    $name = $this->identifier();
+                    $this->expectSymbol('(');
+                    $columns = $this->parseColumnList();
+                    $actions[] = ['kind' => 'add_index', 'name' => $name, 'columns' => $columns, 'unique' => false];
+                } elseif ($this->matchKeyword('UNIQUE')) {
+                    $this->matchKeyword('INDEX') || $this->matchKeyword('KEY');
+                    $name = $this->identifier();
+                    $this->expectSymbol('(');
+                    $columns = $this->parseColumnList();
+                    $actions[] = ['kind' => 'add_index', 'name' => $name, 'columns' => $columns, 'unique' => true];
+                } elseif ($this->matchKeyword('PRIMARY')) {
+                    $this->expectKeyword('KEY');
+                    $this->expectSymbol('(');
+                    $columns = $this->parseColumnList();
+                    $actions[] = ['kind' => 'add_primary', 'columns' => $columns];
+                } else {
+                    $column = $this->parseColumnDefinition();
+                    $actions[] = ['kind' => 'add_column', 'column' => $column];
+                }
+                continue;
+            }
+            if ($this->matchKeyword('DROP')) {
+                $this->matchKeyword('COLUMN');
+                if ($this->matchKeyword('PRIMARY')) {
+                    $this->expectKeyword('KEY');
+                    $actions[] = ['kind' => 'drop_primary'];
+                } elseif ($this->matchKeyword('INDEX') || $this->matchKeyword('KEY')) {
+                    $actions[] = ['kind' => 'drop_index', 'name' => $this->identifier()];
+                } elseif ($this->matchKeyword('CONSTRAINT')) {
+                    $actions[] = ['kind' => 'drop_constraint', 'name' => $this->identifier()];
+                } else {
+                    $actions[] = ['kind' => 'drop_column', 'name' => $this->identifier()];
+                }
+                continue;
+            }
+            if ($this->matchKeyword('MODIFY')) {
+                $this->matchKeyword('COLUMN');
+                $column = $this->parseColumnDefinition();
+                $actions[] = ['kind' => 'modify_column', 'column' => $column];
+                continue;
+            }
+            if ($this->matchKeyword('CHANGE')) {
+                $this->matchKeyword('COLUMN');
+                $oldName = $this->identifier();
+                $column = $this->parseColumnDefinition();
+                $actions[] = ['kind' => 'change_column', 'old_name' => $oldName, 'column' => $column];
+                continue;
+            }
+            if ($this->matchKeyword('RENAME')) {
+                if ($this->matchKeyword('TO')) {
+                    $actions[] = ['kind' => 'rename_table', 'new_name' => $this->identifier()];
+                } elseif ($this->matchKeyword('COLUMN')) {
+                    $oldName = $this->identifier();
+                    $this->expectKeyword('TO');
+                    $newName = $this->identifier();
+                    $actions[] = ['kind' => 'rename_column', 'old_name' => $oldName, 'new_name' => $newName];
+                } elseif ($this->matchKeyword('INDEX') || $this->matchKeyword('KEY')) {
+                    $oldName = $this->identifier();
+                    $this->expectKeyword('TO');
+                    $newName = $this->identifier();
+                    $actions[] = ['kind' => 'rename_index', 'old_name' => $oldName, 'new_name' => $newName];
+                } else {
+                    throw $this->error('Expected TO, COLUMN, or INDEX after RENAME in ALTER TABLE.');
+                }
+                continue;
+            }
+            throw $this->error('Unsupported ALTER TABLE clause.');
+        } while ($this->matchSymbol(','));
+
+        return ['type' => 'alter_table', 'table' => $table, 'actions' => $actions];
     }
 
     private function parseRenameTable(): array
@@ -598,6 +756,18 @@ final class Parser
                 $this->nestingDepth--;
             }
         }
+        if ($this->peekSymbol('(') && $this->peekKeyword('SELECT', 1)) {
+            $this->matchSymbol('(');
+            $this->matchKeyword('SELECT');
+            $this->enterNesting();
+            try {
+                $subquery = $this->parseSelect();
+                $this->expectSymbol(')');
+            } finally {
+                $this->nestingDepth--;
+            }
+            return ['kind' => 'subquery', 'subquery' => $subquery];
+        }
         if ($this->matchSymbol('(')) {
             $this->enterNesting();
             try {
@@ -617,6 +787,18 @@ final class Parser
     private function parsePredicate(): array
     {
         $this->enterExpression();
+        if ($this->matchKeyword('EXISTS')) {
+            $this->expectSymbol('(');
+            $this->matchKeyword('SELECT');
+            $this->enterNesting();
+            try {
+                $subquery = $this->parseSelect();
+                $this->expectSymbol(')');
+            } finally {
+                $this->nestingDepth--;
+            }
+            return ['kind' => 'exists', 'subquery' => $subquery];
+        }
         return $this->parsePredicateFrom($this->parseOperand());
     }
 
@@ -634,6 +816,11 @@ final class Parser
         }
         if ($this->matchKeyword('IN')) {
             $this->expectSymbol('(');
+            if ($this->matchKeyword('SELECT')) {
+                $subquery = $this->parseSelect();
+                $this->expectSymbol(')');
+                return ['kind' => 'in_subquery', 'operand' => $left, 'subquery' => $subquery, 'not' => $not];
+            }
             $values = [];
             if (!$this->peekSymbol(')')) {
                 do {
@@ -642,7 +829,7 @@ final class Parser
             }
             $this->expectSymbol(')');
             if ($values === []) {
-                throw $this->error('IN requires at least one value.');
+                throw $this->error('IN requires at least one value or subquery.');
             }
             return ['kind' => 'in', 'operand' => $left, 'values' => $values, 'not' => $not];
         }
@@ -668,11 +855,23 @@ final class Parser
 
     private function parseOperand(): array
     {
+        if ($this->peekSymbol('(') && $this->peekKeyword('SELECT', 1)) {
+            $this->matchSymbol('(');
+            $this->matchKeyword('SELECT');
+            $this->enterNesting();
+            try {
+                $subquery = $this->parseSelect();
+                $this->expectSymbol(')');
+            } finally {
+                $this->nestingDepth--;
+            }
+            return ['kind' => 'subquery', 'subquery' => $subquery];
+        }
         if ($this->canStartValue()) {
             return $this->parseValueNode(false);
         }
         if ($this->current()->type === 'IDENTIFIER') {
-            return ['kind' => 'column', 'name' => $this->identifier()];
+            return ['kind' => 'column', 'name' => $this->qualifiedIdentifier()];
         }
         throw $this->error('Expected a column or value.');
     }
@@ -897,6 +1096,11 @@ final class Parser
         return $this->tokens[$this->position++];
     }
 
+    private function isFunctionStart(): bool
+    {
+        return $this->peekSymbol('(', 1);
+    }
+
     private function error(string $message, ?Token $token = null): FoxyException
     {
         $token ??= $this->current();
@@ -927,5 +1131,146 @@ final class Parser
         if (++$this->expressionNodes > 4_096) {
             throw $this->error('SQL expression is too complex.');
         }
+    }
+
+    private function parseGrant(): array
+    {
+        $isPrivilege = $this->peekKeyword('ALL') || $this->peekKeyword('SELECT')
+            || $this->peekKeyword('INSERT') || $this->peekKeyword('UPDATE')
+            || $this->peekKeyword('DELETE') || $this->peekKeyword('CREATE')
+            || $this->peekKeyword('DROP') || $this->peekKeyword('ALTER')
+            || $this->peekKeyword('INDEX') || $this->peekKeyword('CONNECT')
+            || $this->peekKeyword('SHOW') || $this->peekKeyword('TRUNCATE');
+        if ($isPrivilege) {
+            $privilege = strtoupper($this->identifier());
+            $this->expectKeyword('ON');
+            $database = $this->identifier();
+            $table = '*';
+            if ($this->matchSymbol('.')) {
+                if ($this->peekSymbol('*')) {
+                    $this->matchSymbol('*');
+                } else {
+                    $table = $this->identifier();
+                }
+            } else {
+                $table = $database;
+                $database = '*';
+            }
+            $this->expectKeyword('TO');
+            $grantee = $this->identifier();
+            return [
+                'type' => 'grant',
+                'kind' => 'privilege',
+                'privilege' => $privilege,
+                'database' => $database,
+                'table' => $table,
+                'grantee' => $grantee,
+            ];
+        }
+        $role = $this->identifier();
+        $this->expectKeyword('TO');
+        $grantee = $this->identifier();
+        return [
+            'type' => 'grant',
+            'kind' => 'role',
+            'role' => $role,
+            'grantee' => $grantee,
+        ];
+    }
+
+    private function parseRevoke(): array
+    {
+        $isPrivilege = $this->peekKeyword('ALL') || $this->peekKeyword('SELECT')
+            || $this->peekKeyword('INSERT') || $this->peekKeyword('UPDATE')
+            || $this->peekKeyword('DELETE') || $this->peekKeyword('CREATE')
+            || $this->peekKeyword('DROP') || $this->peekKeyword('ALTER')
+            || $this->peekKeyword('INDEX') || $this->peekKeyword('CONNECT')
+            || $this->peekKeyword('SHOW') || $this->peekKeyword('TRUNCATE');
+        if ($isPrivilege) {
+            $privilege = strtoupper($this->identifier());
+            $this->expectKeyword('ON');
+            $database = $this->identifier();
+            $table = '*';
+            if ($this->matchSymbol('.')) {
+                if ($this->peekSymbol('*')) {
+                    $this->matchSymbol('*');
+                } else {
+                    $table = $this->identifier();
+                }
+            } else {
+                $table = $database;
+                $database = '*';
+            }
+            $this->expectKeyword('FROM');
+            $grantee = $this->identifier();
+            return [
+                'type' => 'revoke',
+                'kind' => 'privilege',
+                'privilege' => $privilege,
+                'database' => $database,
+                'table' => $table,
+                'grantee' => $grantee,
+            ];
+        }
+        $role = $this->identifier();
+        $this->expectKeyword('FROM');
+        $grantee = $this->identifier();
+        return [
+            'type' => 'revoke',
+            'kind' => 'role',
+            'role' => $role,
+            'grantee' => $grantee,
+        ];
+    }
+
+    private function parseCreatePolicy(): array
+    {
+        $name = $this->identifier();
+        $this->expectKeyword('ON');
+        $table = $this->qualifiedIdentifier();
+        $this->expectKeyword('FOR');
+        $operation = strtoupper($this->identifier());
+        if (!in_array($operation, ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'ALL'], true)) {
+            throw $this->error("Expected SELECT, INSERT, UPDATE, DELETE, or ALL after FOR.");
+        }
+        $this->expectKeyword('USING');
+        $this->expectSymbol('(');
+        $expression = $this->parseExpression();
+        $this->expectSymbol(')');
+        return [
+            'type' => 'create_policy',
+            'name' => $name,
+            'table' => $table,
+            'operation' => $operation,
+            'expression' => $expression,
+        ];
+    }
+
+    private function parseDropPolicy(): array
+    {
+        $name = $this->identifier();
+        $ifExists = $this->parseIfExists();
+        $this->expectKeyword('ON');
+        $table = $this->qualifiedIdentifier();
+        return [
+            'type' => 'drop_policy',
+            'name' => $name,
+            'if_exists' => $ifExists,
+            'table' => $table,
+        ];
+    }
+
+    private function parseBegin(): array
+    {
+        $this->matchKeyword('WORK');
+        $this->matchKeyword('TRANSACTION');
+        return ['type' => 'begin'];
+    }
+
+    private function parseEndKeyword(string $type): array
+    {
+        $this->matchKeyword('WORK');
+        $this->matchKeyword('TRANSACTION');
+        return ['type' => $type];
     }
 }
