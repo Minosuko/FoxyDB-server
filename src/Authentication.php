@@ -129,10 +129,159 @@ final class Authentication
 
     private function bootstrap(): void
     {
-        $this->storage->createDatabase(self::SYSTEM_DATABASE, true);
-        $types = new TypeSystem($this->config);
+        self::ensureSystemSchema($this->storage, $this->config);
 
-        $tables = [
+        $markerPath = $this->config->dataDirectory . DIRECTORY_SEPARATOR . 'auth.initialized';
+        $statePath = $this->config->dataDirectory . DIRECTORY_SEPARATOR . 'auth.bootstrap.state';
+        $authenticationInitialized = is_file($markerPath);
+        if (!$authenticationInitialized) {
+            $users = $this->storage->table(self::SYSTEM_DATABASE, 'users_schema');
+            $hasUsers = false;
+            foreach ($users->rows() as $_entry) {
+                $hasUsers = true;
+                break;
+            }
+            $completeDefaultBootstrap = !$hasUsers || is_file($statePath);
+            if ($completeDefaultBootstrap) {
+                if (!is_file($statePath)) {
+                    FileSystem::atomicWrite($statePath, "default-root\n", $this->config->syncWrites);
+                }
+                try {
+                    if ($this->findUser(self::DEFAULT_USERNAME) === null) {
+                        $users->insert([
+                            'username' => self::DEFAULT_USERNAME,
+                            'password_hash' => $this->hashPassword(self::DEFAULT_PASSWORD),
+                            'enabled' => true,
+                        ]);
+                    }
+                } catch (FoxyException $exception) {
+                    if ($exception->errorCode !== 'UNIQUE_VIOLATION') {
+                        throw $exception;
+                    }
+                }
+                $root = $this->findUser(self::DEFAULT_USERNAME);
+                if ($root !== null) {
+                    $this->seedRow('privileges', [
+                        'account_id' => $root['account_id'],
+                        'database_name' => '*',
+                        'table_name' => '*',
+                        'privilege' => 'ALL',
+                    ], [
+                        'username' => self::DEFAULT_USERNAME,
+                        'account_id' => $root['account_id'],
+                        'database_name' => '*',
+                        'table_name' => '*',
+                        'privilege' => 'ALL',
+                    ]);
+                }
+            }
+            FileSystem::atomicWrite($markerPath, "FXAUTH1\n", $this->config->syncWrites);
+            if (is_file($statePath)) {
+                @unlink($statePath);
+            }
+        } elseif (is_file($statePath)) {
+            @unlink($statePath);
+        }
+        $this->seedRow('config_schema', ['config_key' => 'server_version'], [
+            'config_key' => 'server_version',
+            'config_value' => '1',
+        ]);
+        $this->seedRow('config_schema', ['config_key' => 'default_port'], [
+            'config_key' => 'default_port',
+            'config_value' => (string) $this->config->port,
+        ]);
+        $this->seedRow('config_schema', ['config_key' => 'enable_log'], [
+            'config_key' => 'enable_log',
+            'config_value' => $this->config->enableLog ? 'true' : 'false',
+        ]);
+        $this->seedRow('performance_schema', ['metric_name' => 'server_starts'], [
+            'metric_name' => 'server_starts',
+            'metric_value' => 1.0,
+        ]);
+        $this->seedRow('sys_config', ['variable_name' => 'chunk_bytes'], [
+            'variable_name' => 'chunk_bytes',
+            'variable_value' => (string) $this->config->chunkBytes,
+            'description' => 'Maximum bytes in each stored chunk.',
+        ]);
+        $this->seedRow('sys_config', ['variable_name' => 'inline_value_bytes'], [
+            'variable_name' => 'inline_value_bytes',
+            'variable_value' => (string) $this->config->inlineValueBytes,
+            'description' => 'Threshold for moving large values into chunk storage.',
+        ]);
+    }
+
+    private function findUser(string $username): ?array
+    {
+        $this->synchronizeAuthorizationCaches();
+        $cached = $this->userCache->get($username);
+        if (is_array($cached) && array_key_exists('user', $cached)) {
+            return $cached['user'];
+        }
+        $table = $this->storage->table(self::SYSTEM_DATABASE, 'users_schema');
+        $lookup = $table->lookupForEqualities(['username' => $username]);
+        foreach ($table->rows($lookup) as $entry) {
+            if ($entry['values']['username'] === $username) {
+                $this->userCache->put($username, ['user' => $entry['values']]);
+                return $entry['values'];
+            }
+        }
+        $this->userCache->put($username, ['user' => null]);
+        return null;
+    }
+
+    private function privilegesFor(string $accountId): array
+    {
+        $this->synchronizeAuthorizationCaches();
+        $cached = $this->privilegeCache->get($accountId);
+        if (is_array($cached) && isset($cached['rows']) && is_array($cached['rows'])) {
+            return $cached['rows'];
+        }
+        $rows = [];
+        $privileges = $this->storage->table(self::SYSTEM_DATABASE, 'privileges');
+        $lookup = $privileges->lookupForEqualities(['account_id' => $accountId]);
+        foreach ($privileges->rows($lookup) as $entry) {
+            $rows[] = $entry['values'];
+        }
+        $this->privilegeCache->put($accountId, ['rows' => $rows]);
+        return $rows;
+    }
+
+    private function synchronizeAuthorizationCaches(): void
+    {
+        $revision = $this->storage->tableRevision(self::SYSTEM_DATABASE, 'users_schema')
+            . ':' . $this->storage->tableRevision(self::SYSTEM_DATABASE, 'privileges')
+            . ':' . $this->storage->tableRevision(self::SYSTEM_DATABASE, 'roles')
+            . ':' . $this->storage->tableRevision(self::SYSTEM_DATABASE, 'role_assignments');
+        if ($revision === $this->authorizationRevision) {
+            return;
+        }
+        $this->authorizationRevision = $revision;
+        $this->userCache->clear();
+        $this->privilegeCache->clear();
+    }
+
+    public static function ensureSystemSchema(StorageEngine $storage, Config $config): void
+    {
+        $storage->createDatabase(self::SYSTEM_DATABASE, true);
+        $types = new TypeSystem($config);
+
+        $tables = self::systemTableDefinitions();
+        foreach ($tables as $name => $definition) {
+            $storage->createTable(
+                self::SYSTEM_DATABASE,
+                $name,
+                $types->compileSchema($name, $definition),
+                true,
+            );
+        }
+    }
+
+    /**
+     * @return list<array{name: string, definition: array}>
+     */
+    public static function systemTableDefinitions(): array
+    {
+        return [
             'users_schema' => [
                 'columns' => [
                     ['name' => 'username', 'type' => 'VARCHAR', 'length' => 64, 'nullable' => false],
@@ -289,143 +438,6 @@ final class Authentication
                 ],
             ],
         ];
-
-        foreach ($tables as $name => $definition) {
-            $this->storage->createTable(
-                self::SYSTEM_DATABASE,
-                $name,
-                $types->compileSchema($name, $definition),
-                true,
-            );
-        }
-
-        $markerPath = $this->config->dataDirectory . DIRECTORY_SEPARATOR . 'auth.initialized';
-        $statePath = $this->config->dataDirectory . DIRECTORY_SEPARATOR . 'auth.bootstrap.state';
-        $authenticationInitialized = is_file($markerPath);
-        if (!$authenticationInitialized) {
-            $users = $this->storage->table(self::SYSTEM_DATABASE, 'users_schema');
-            $hasUsers = false;
-            foreach ($users->rows() as $_entry) {
-                $hasUsers = true;
-                break;
-            }
-            $completeDefaultBootstrap = !$hasUsers || is_file($statePath);
-            if ($completeDefaultBootstrap) {
-                if (!is_file($statePath)) {
-                    FileSystem::atomicWrite($statePath, "default-root\n", $this->config->syncWrites);
-                }
-                try {
-                    if ($this->findUser(self::DEFAULT_USERNAME) === null) {
-                        $users->insert([
-                            'username' => self::DEFAULT_USERNAME,
-                            'password_hash' => $this->hashPassword(self::DEFAULT_PASSWORD),
-                            'enabled' => true,
-                        ]);
-                    }
-                } catch (FoxyException $exception) {
-                    if ($exception->errorCode !== 'UNIQUE_VIOLATION') {
-                        throw $exception;
-                    }
-                }
-                $root = $this->findUser(self::DEFAULT_USERNAME);
-                if ($root !== null) {
-                    $this->seedRow('privileges', [
-                        'account_id' => $root['account_id'],
-                        'database_name' => '*',
-                        'table_name' => '*',
-                        'privilege' => 'ALL',
-                    ], [
-                        'username' => self::DEFAULT_USERNAME,
-                        'account_id' => $root['account_id'],
-                        'database_name' => '*',
-                        'table_name' => '*',
-                        'privilege' => 'ALL',
-                    ]);
-                }
-            }
-            FileSystem::atomicWrite($markerPath, "FXAUTH1\n", $this->config->syncWrites);
-            if (is_file($statePath)) {
-                @unlink($statePath);
-            }
-        } elseif (is_file($statePath)) {
-            @unlink($statePath);
-        }
-        $this->seedRow('config_schema', ['config_key' => 'server_version'], [
-            'config_key' => 'server_version',
-            'config_value' => '1',
-        ]);
-        $this->seedRow('config_schema', ['config_key' => 'default_port'], [
-            'config_key' => 'default_port',
-            'config_value' => (string) $this->config->port,
-        ]);
-        $this->seedRow('config_schema', ['config_key' => 'enable_log'], [
-            'config_key' => 'enable_log',
-            'config_value' => $this->config->enableLog ? 'true' : 'false',
-        ]);
-        $this->seedRow('performance_schema', ['metric_name' => 'server_starts'], [
-            'metric_name' => 'server_starts',
-            'metric_value' => 1.0,
-        ]);
-        $this->seedRow('sys_config', ['variable_name' => 'chunk_bytes'], [
-            'variable_name' => 'chunk_bytes',
-            'variable_value' => (string) $this->config->chunkBytes,
-            'description' => 'Maximum bytes in each stored chunk.',
-        ]);
-        $this->seedRow('sys_config', ['variable_name' => 'inline_value_bytes'], [
-            'variable_name' => 'inline_value_bytes',
-            'variable_value' => (string) $this->config->inlineValueBytes,
-            'description' => 'Threshold for moving large values into chunk storage.',
-        ]);
-    }
-
-    private function findUser(string $username): ?array
-    {
-        $this->synchronizeAuthorizationCaches();
-        $cached = $this->userCache->get($username);
-        if (is_array($cached) && array_key_exists('user', $cached)) {
-            return $cached['user'];
-        }
-        $table = $this->storage->table(self::SYSTEM_DATABASE, 'users_schema');
-        $lookup = $table->lookupForEqualities(['username' => $username]);
-        foreach ($table->rows($lookup) as $entry) {
-            if ($entry['values']['username'] === $username) {
-                $this->userCache->put($username, ['user' => $entry['values']]);
-                return $entry['values'];
-            }
-        }
-        $this->userCache->put($username, ['user' => null]);
-        return null;
-    }
-
-    private function privilegesFor(string $accountId): array
-    {
-        $this->synchronizeAuthorizationCaches();
-        $cached = $this->privilegeCache->get($accountId);
-        if (is_array($cached) && isset($cached['rows']) && is_array($cached['rows'])) {
-            return $cached['rows'];
-        }
-        $rows = [];
-        $privileges = $this->storage->table(self::SYSTEM_DATABASE, 'privileges');
-        $lookup = $privileges->lookupForEqualities(['account_id' => $accountId]);
-        foreach ($privileges->rows($lookup) as $entry) {
-            $rows[] = $entry['values'];
-        }
-        $this->privilegeCache->put($accountId, ['rows' => $rows]);
-        return $rows;
-    }
-
-    private function synchronizeAuthorizationCaches(): void
-    {
-        $revision = $this->storage->tableRevision(self::SYSTEM_DATABASE, 'users_schema')
-            . ':' . $this->storage->tableRevision(self::SYSTEM_DATABASE, 'privileges')
-            . ':' . $this->storage->tableRevision(self::SYSTEM_DATABASE, 'roles')
-            . ':' . $this->storage->tableRevision(self::SYSTEM_DATABASE, 'role_assignments');
-        if ($revision === $this->authorizationRevision) {
-            return;
-        }
-        $this->authorizationRevision = $revision;
-        $this->userCache->clear();
-        $this->privilegeCache->clear();
     }
 
     private function bootstrapWithLock(): void

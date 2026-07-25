@@ -226,18 +226,26 @@ final class Table
                 yield from $prefetched;
                 return;
             }
+            $batchCount = 0;
             foreach (array_chunk($rowIds, 256) as $batch) {
                 foreach ($this->readCurrentRows($batch) as $entry) {
                     yield $entry;
+                }
+                if (++$batchCount % 4 === 0) {
+                    \FoxyDB\Server::fiberYield();
                 }
             }
             return;
         }
         yield from $prefetched;
+        $batchCount = 0;
         for ($first = 257; $first <= $maximum; $first += 256) {
             $last = min($maximum, $first + 255);
             foreach ($this->readCurrentRows(range($first, $last)) as $entry) {
                 yield $entry;
+            }
+            if (++$batchCount % 4 === 0) {
+                \FoxyDB\Server::fiberYield();
             }
         }
     }
@@ -1873,14 +1881,30 @@ final class Table
 
     private function acquireLock(int $operation)
     {
-        $stream = @fopen($this->lockPath, 'c+b');
-        if ($stream === false || !flock($stream, $operation)) {
-            if (is_resource($stream)) {
-                fclose($stream);
+        $retries = 0;
+        while (true) {
+            $stream = @fopen($this->lockPath, 'c+b');
+            if ($stream === false) {
+                throw new FoxyException('Unable to open table lock file.', 'STORAGE_LOCK');
             }
-            throw new FoxyException('Unable to acquire table lock.', 'STORAGE_LOCK');
+            if (flock($stream, $operation | LOCK_NB)) {
+                return $stream;
+            }
+            fclose($stream);
+            if (!class_exists(\Fiber::class) || \Fiber::getCurrent() === null) {
+                usleep(1_000);
+                $retries++;
+                if ($retries > 5_000) {
+                    throw new FoxyException('Unable to acquire table lock.', 'STORAGE_LOCK');
+                }
+                continue;
+            }
+            \FoxyDB\Server::fiberYield(1_000);
+            $retries++;
+            if ($retries > 10_000) {
+                throw new FoxyException('Unable to acquire table lock.', 'STORAGE_LOCK');
+            }
         }
-        return $stream;
     }
 
     private function acquireReadyReadLock()

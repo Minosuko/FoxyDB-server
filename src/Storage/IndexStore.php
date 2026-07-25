@@ -17,6 +17,7 @@ final class IndexStore
 {
     private const HEADER_BYTES = 17;
     private const MAXIMUM_KEY_BYTES = 4_096;
+    private const ORDERED_PAGE_SIZE = 256;
     private int $revision = 0;
 
     public function __construct(
@@ -75,6 +76,67 @@ final class IndexStore
             }
         }
         return $key;
+    }
+
+    public static function orderedKey(array $values): string
+    {
+        $key = '';
+        foreach ($values as $value) {
+            if ($value === null) {
+                $part = "\x00";
+                $type = 'N';
+            } elseif (is_bool($value)) {
+                $part = $value ? "\x01" : "\x00";
+                $type = 'B';
+            } elseif (is_int($value)) {
+                $part = BinaryCodec::uint64($value < 0 ? $value + 9_223_372_036_854_775_808 : $value + 9_223_372_036_854_775_808);
+                $type = 'I';
+            } elseif (is_float($value)) {
+                $bits = current(unpack('J', pack('E', $value === 0.0 ? 0.0 : $value)));
+                if ($bits & (1 << 63)) {
+                    $bits ^= 0xFFFFFFFFFFFFFFFF;
+                } else {
+                    $bits |= (1 << 63);
+                }
+                $part = BinaryCodec::uint64($bits);
+                $type = 'F';
+            } elseif ($value instanceof BinaryValue) {
+                $part = $value->bytes;
+                $type = 'X';
+            } elseif ($value instanceof ChunkedValue) {
+                throw new FoxyException('Chunked values cannot be indexed.', 'INDEX_KEY_TOO_LARGE');
+            } elseif ($value instanceof StreamValue) {
+                if ($value->format !== 'binary' || $value->bytes > self::MAXIMUM_KEY_BYTES) {
+                    throw new FoxyException('Streamed index value is invalid or too large.', 'INDEX_KEY_TOO_LARGE');
+                }
+                $stream = $value->open();
+                try {
+                    $part = FileSystem::readExact($stream, $value->bytes) ?? '';
+                    if (fread($stream, 1) !== '') {
+                        throw new FoxyException('Stream contains more bytes than declared.', 'INVALID_VALUE');
+                    }
+                } finally {
+                    fclose($stream);
+                }
+                $type = 'X';
+            } elseif (is_string($value)) {
+                $part = $value;
+                $type = 'S';
+            } else {
+                throw new FoxyException('Unsupported index value.', 'INVALID_VALUE');
+            }
+            $key .= $type . BinaryCodec::uint32(strlen($part)) . $part;
+            if (strlen($key) > self::MAXIMUM_KEY_BYTES) {
+                throw new FoxyException('Index key exceeds 4096 bytes.', 'INDEX_KEY_TOO_LARGE');
+            }
+        }
+        return $key;
+    }
+
+    public static function orderedKeyPrefix(array $values, int $count): string
+    {
+        $values = array_slice($values, 0, $count);
+        return self::orderedKey($values);
     }
 
     public static function containsNull(array $values): bool

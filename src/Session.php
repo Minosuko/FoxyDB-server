@@ -382,9 +382,19 @@ final class Session
         if ($hasJoin) {
             return $this->selectJoin($from, $statement, $parameters);
         }
-        $table = $this->table($statement['table'] ?? $from[0]['table']);
+        $fromEntry = $from[0] ?? ['table' => $statement['table']];
+        $table = $this->table($fromEntry['table']);
         $schema = $table->schema();
         $columns = $this->columnMap($schema);
+        $tableName = $fromEntry['table'];
+        $alias = $fromEntry['alias'] ?? null;
+        foreach ($schema['columns'] as $col) {
+            $qualified = $tableName . '.' . $col['name'];
+            $columns[$qualified] = $col;
+            if ($alias !== null) {
+                $columns[$alias . '.' . $col['name']] = $col;
+            }
+        }
         $predicate = $this->predicate($statement['where'], $columns, $parameters);
         $lookup = $this->lookup($table, $statement['where'], $columns, $parameters, $schema);
         $limit = $this->nonNegativeInteger($statement['limit'], $parameters, 'LIMIT');
@@ -770,7 +780,11 @@ $groupColumns = $statement['group'] ?? [];
             }
         }
 
-        $havPred = $having !== null ? $this->predicate($having, $columnMap, []) : null;
+        $havColumns = $columnMap;
+        foreach ($projections as $proj) {
+            $havColumns[$proj['alias']] = ['name' => $proj['alias'], 'type' => 'BIGINT', 'nullable' => true];
+        }
+        $havPred = $having !== null ? $this->predicate($having, $havColumns, []) : null;
         $limit = $limit ?? PHP_INT_MAX;
         $maxRows = $this->config->maxRowsPerResult;
 
@@ -1537,18 +1551,18 @@ $groupColumns = $statement['group'] ?? [];
         return static fn(array $row): bool => $evaluator($row) === true;
     }
 
-    private function executeSelectAllRows(array $statement): array
+    private function executeSelectAllRows(array $statement, array $parameters = []): array
     {
-        $result = $this->select($statement, []);
+        $result = $this->select($statement, $parameters);
         if (is_array($result->rows)) {
             return $result->rows;
         }
         return iterator_to_array($result->rows, false);
     }
 
-    private function executeSubqueryValues(array $subquery): array
+    private function executeSubqueryValues(array $subquery, array $parameters = []): array
     {
-        $rows = $this->executeSelectAllRows($subquery);
+        $rows = $this->executeSelectAllRows($subquery, $parameters);
         $values = [];
         foreach ($rows as $row) {
             if (is_array($row)) {
@@ -1558,9 +1572,9 @@ $groupColumns = $statement['group'] ?? [];
         return $values;
     }
 
-    private function executeScalarSubquery(array $subquery): mixed
+    private function executeScalarSubquery(array $subquery, array $parameters = []): mixed
     {
-        $rows = $this->executeSelectAllRows($subquery);
+        $rows = $this->executeSelectAllRows($subquery, $parameters);
         foreach ($rows as $row) {
             if (is_array($row)) {
                 return reset($row);
@@ -1580,8 +1594,8 @@ $groupColumns = $statement['group'] ?? [];
             'like' => $this->likeEvaluator($expression, $columns, $parameters),
             'truthy' => $this->truthyEvaluator($expression, $columns, $parameters),
             'in_subquery' => $this->inSubqueryEvaluator($expression, $columns, $parameters),
-            'exists' => $this->existsEvaluator($expression),
-            'subquery' => $this->scalarSubqueryEvaluator($expression),
+            'exists' => $this->existsEvaluator($expression, $parameters),
+            'subquery' => $this->scalarSubqueryEvaluator($expression, $parameters),
             default => throw new FoxyException('Unsupported WHERE expression.', 'SQL_SEMANTIC'),
         };
     }
@@ -1778,7 +1792,7 @@ $groupColumns = $statement['group'] ?? [];
     private function inSubqueryEvaluator(array $expression, array $columns, array $parameters): \Closure
     {
         $left = $this->operand($expression['operand'], $columns, $parameters);
-        $subqueryValues = $this->executeSubqueryValues($expression['subquery']);
+        $subqueryValues = $this->executeSubqueryValues($expression['subquery'], $parameters);
         $not = $expression['not'];
         return function (array $row) use ($left, $subqueryValues, $not): ?bool {
             $needle = ($left['get'])($row);
@@ -1797,15 +1811,15 @@ $groupColumns = $statement['group'] ?? [];
         };
     }
 
-    private function existsEvaluator(array $expression): \Closure
+    private function existsEvaluator(array $expression, array $parameters): \Closure
     {
-        $hasRows = count($this->executeSelectAllRows($expression['subquery'])) > 0;
+        $hasRows = count($this->executeSelectAllRows($expression['subquery'], $parameters)) > 0;
         return static fn(array $row): bool => $hasRows;
     }
 
-    private function scalarSubqueryEvaluator(array $expression): \Closure
+    private function scalarSubqueryEvaluator(array $expression, array $parameters): \Closure
     {
-        $value = $this->executeScalarSubquery($expression['subquery']);
+        $value = $this->executeScalarSubquery($expression['subquery'], $parameters);
         return static fn(array $row): ?bool => $value === null ? null : (bool) $value;
     }
 
@@ -1816,15 +1830,17 @@ $groupColumns = $statement['group'] ?? [];
                 throw new FoxyException("Unknown column: {$node['name']}", 'UNKNOWN_COLUMN');
             }
             $name = $node['name'];
+            $parts = explode('.', $name);
+            $base = count($parts) === 2 ? $parts[1] : $name;
             return [
-                'get' => static fn(array $row): mixed => $row[$name],
+                'get' => static fn(array $row): mixed => array_key_exists($base, $row) ? $row[$base] : ($row[$name] ?? null),
                 'constant' => false,
-                'column' => $name,
+                'column' => $base,
                 'value' => null,
             ];
         }
         if ($node['kind'] === 'subquery') {
-            $value = $this->executeScalarSubquery($node['subquery']);
+            $value = $this->executeScalarSubquery($node['subquery'], $parameters);
             return [
                 'get' => static fn(array $row): mixed => $value,
                 'constant' => true,
@@ -1971,7 +1987,10 @@ $groupColumns = $statement['group'] ?? [];
             if ($projection['kind'] === 'value') {
                 $result[$projection['alias']] = $projection['value']['value'] ?? null;
             } else {
-                $result[$projection['alias']] = $row[$projection['column']];
+                $column = $projection['column'];
+                $parts = explode('.', $column);
+                $base = count($parts) === 2 ? $parts[1] : $column;
+                $result[$projection['alias']] = array_key_exists($base, $row) ? $row[$base] : ($row[$column] ?? null);
             }
         }
         return $result;

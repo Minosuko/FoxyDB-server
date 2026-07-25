@@ -30,6 +30,8 @@ final class Server
     private array $clients = [];
     private array $sessionCache = [];
     private array $connectErrors = [];
+    private array $readyFibers = [];
+    private array $pendingFibers = [];
     private readonly StorageEngine $storage;
     private readonly Authentication $authentication;
     private readonly SystemVariables $systemVariables;
@@ -111,6 +113,8 @@ final class Server
 
         try {
             while ($this->running) {
+                $this->resumeReadyFibers();
+                $this->processPendingFibers();
                 $read = [$server];
                 $write = [];
                 foreach ($this->clients as $client) {
@@ -130,7 +134,8 @@ final class Server
                 }
                 $writeSet = $write === [] ? null : $write;
                 $except = null;
-                $selected = @stream_select($read, $writeSet, $except, 1);
+                $timeout = $this->readyFibers !== [] || $this->pendingFibers !== [] ? 0 : 1;
+                $selected = @stream_select($read, $writeSet, $except, $timeout);
                 if ($selected === false) {
                     if (!$this->running) {
                         break;
@@ -182,6 +187,90 @@ final class Server
     public function stop(): void
     {
         $this->running = false;
+    }
+
+    private function startFiber(int $clientId, array $request): void
+    {
+        $context = ['clientId' => $clientId, 'request' => $request];
+        $fiber = new \Fiber(function () use ($context): void {
+            $this->handleRequest($context['clientId'], $context['request']);
+        });
+        $this->pendingFibers[] = ['fiber' => $fiber, 'clientId' => $clientId, 'started' => hrtime(true)];
+    }
+
+private function resumeReadyFibers(): void
+    {
+        if ($this->readyFibers === []) {
+            return;
+        }
+        $snapshot = $this->readyFibers;
+        $this->readyFibers = [];
+        foreach ($snapshot as $entry) {
+            $fiber = $entry['fiber'];
+            $clientId = $entry['clientId'];
+            if (!isset($this->clients[$clientId])) {
+                continue;
+            }
+            if ($fiber->isTerminated()) {
+                continue;
+            }
+            try {
+                $fiber->resume();
+            } catch (\Throwable $exception) {
+                if (isset($this->clients[$clientId])) {
+                    $this->sendError(
+                        $clientId,
+                        null,
+                        new FoxyException('Query execution failed: ' . $exception->getMessage(), 'INTERNAL_ERROR'),
+                    );
+                }
+                continue;
+            }
+            if ($fiber->isSuspended()) {
+                $this->readyFibers[] = ['fiber' => $fiber, 'clientId' => $clientId];
+            }
+        }
+    }
+
+    private function processPendingFibers(): void
+    {
+        if ($this->pendingFibers === []) {
+            return;
+        }
+        $pending = $this->pendingFibers;
+        $this->pendingFibers = [];
+        foreach ($pending as $entry) {
+            $fiber = $entry['fiber'];
+            $clientId = $entry['clientId'];
+            if (!isset($this->clients[$clientId])) {
+                continue;
+            }
+            try {
+                $fiber->start();
+            } catch (\Throwable $exception) {
+                if (isset($this->clients[$clientId])) {
+                    $this->sendError(
+                        $clientId,
+                        null,
+                        new FoxyException('Query execution failed: ' . $exception->getMessage(), 'INTERNAL_ERROR'),
+                    );
+                }
+                continue;
+            }
+            if ($fiber->isSuspended()) {
+                $this->readyFibers[] = ['fiber' => $fiber, 'clientId' => $clientId];
+            }
+        }
+    }
+
+    public static function fiberYield(?int $delayMicroseconds = null): void
+    {
+        if (\Fiber::getCurrent() !== null) {
+            \Fiber::suspend();
+        }
+        if ($delayMicroseconds !== null && $delayMicroseconds > 0) {
+            usleep($delayMicroseconds);
+        }
     }
 
     private function acceptClient($server): void
@@ -340,7 +429,12 @@ final class Server
                     continue;
                 }
                 $this->clients[$clientId]['last_activity'] = time();
-                $this->handleRequest($clientId, $request);
+                $requestType = $request['type'] ?? null;
+                if ($requestType === 'query' && class_exists(\Fiber::class)) {
+                    $this->startFiber($clientId, $request);
+                } else {
+                    $this->handleRequest($clientId, $request);
+                }
                 if (isset($this->clients[$clientId]) && $this->clients[$clientId]['close_after_write']) {
                     break;
                 }
