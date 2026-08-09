@@ -22,7 +22,8 @@ $config = new Config(
 );
 
 try {
-    $session = new Session(new StorageEngine($config), $config);
+    $storage = new StorageEngine($config);
+    $session = new Session($storage, $config);
     $session->execute('CREATE DATABASE app');
     $session->execute('USE app');
     $session->execute(<<<'SQL'
@@ -162,8 +163,80 @@ try {
 
     $session->execute('ALTER TABLE records COLLATE utf8mb4_general_ci');
 
+    $session->execute('CREATE TABLE json_docs (id INT PRIMARY KEY AUTO_INCREMENT, payload JSON NOT NULL)');
+    $session->execute(
+        'INSERT INTO json_docs (payload) VALUES (?)',
+        ['{"name":"alpha","status":"active","meta":{"rating":5,"tags":["x","y"]},"items":[10,20,30]}'],
+    );
+    $session->execute(
+        'INSERT INTO json_docs (payload) VALUES (?)',
+        [json_encode(['name' => 'beta', 'status' => 'inactive', 'meta' => ['rating' => 3]], JSON_THROW_ON_ERROR)],
+    );
+    try {
+        $session->execute('INSERT INTO json_docs (payload) VALUES (?)', ['{"broken"']);
+        throw new RuntimeException('Invalid JSON input was accepted.');
+    } catch (FoxyException $exception) {
+        if ($exception->errorCode !== 'INVALID_VALUE') {
+            throw $exception;
+        }
+    }
+    $jsonMatches = $session->execute(
+        "SELECT id FROM json_docs WHERE JSON_EXTRACT(payload, '$.status') = 'active'",
+    );
+    if (array_column(iterator_to_array($jsonMatches->rows, false), 'id') !== [1]) {
+        throw new RuntimeException('JSON_EXTRACT equality did not match.');
+    }
+    $jsonNested = $session->execute(
+        "SELECT JSON_EXTRACT(payload, '$.meta.tags') AS tags FROM json_docs WHERE id = 1"
+    );
+    $jsonNestedRow = iterator_to_array($jsonNested->rows, false)[0];
+    if ($jsonNestedRow['tags'] !== '["x","y"]') {
+        throw new RuntimeException('JSON_EXTRACT did not return a nested array.');
+    }
+    $jsonIndex = $session->execute(
+        "SELECT id FROM json_docs WHERE JSON_EXTRACT(payload, '$.items[2]') = 30"
+    );
+    if (array_column(iterator_to_array($jsonIndex->rows, false), 'id') !== [1]) {
+        throw new RuntimeException('JSON_EXTRACT array index did not match.');
+    }
+    $jsonMissing = $session->execute(
+        "SELECT id FROM json_docs WHERE JSON_EXTRACT(payload, '$.missing') IS NULL"
+    );
+    if (count(iterator_to_array($jsonMissing->rows, false)) !== 2) {
+        throw new RuntimeException('JSON_EXTRACT missing key did not yield NULL.');
+    }
+    try {
+        $session->execute("SELECT id FROM json_docs WHERE JSON_EXTRACT(payload, 'status') = 'active'");
+        throw new RuntimeException('A JSON path without $ was accepted.');
+    } catch (FoxyException $exception) {
+        if ($exception->errorCode !== 'SQL_SEMANTIC') {
+            throw $exception;
+        }
+    }
+    $largeDoc = json_encode(['big' => str_repeat('k', 200_000), 'status' => 'active'], JSON_THROW_ON_ERROR);
+    $session->execute('INSERT INTO json_docs (payload) VALUES (?)', [$largeDoc]);
+    $largeRow = iterator_to_array(
+        $session->execute('SELECT payload FROM json_docs WHERE id = 3')->rows,
+        false,
+    )[0]['payload'];
+    if ($largeRow instanceof ChunkedValue) {
+        $largeRow = $largeRow->materialize(PHP_INT_MAX);
+    }
+    if ($largeRow !== $largeDoc) {
+        throw new RuntimeException('A large JSON document did not round trip.');
+    }
+    $largeExtract = $session->execute(
+        "SELECT id FROM json_docs WHERE JSON_EXTRACT(payload, '$.status') = 'active' AND id > 2"
+    );
+    if (array_column(iterator_to_array($largeExtract->rows, false), 'id') !== [3]) {
+        throw new RuntimeException('JSON_EXTRACT failed on a large chunked document.');
+    }
+
     echo "sql smoke: ok\n";
 } finally {
+    if (isset($storage)) {
+        $storage->close();
+    }
     if (is_dir($directory)) {
         FileSystem::removeTree($directory);
     }

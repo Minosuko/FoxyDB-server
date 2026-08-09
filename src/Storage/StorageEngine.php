@@ -141,6 +141,7 @@ final class StorageEngine
             }
             foreach (array_keys($this->tableHandles) as $key) {
                 if (str_starts_with($key, $name . '.')) {
+                    $this->tableHandles[$key]->closeGenerationStreams();
                     unset($this->tableHandles[$key]);
                 }
             }
@@ -155,6 +156,22 @@ final class StorageEngine
             }
             $this->releaseLock($lock);
         }
+    }
+
+    public function close(): void
+    {
+        foreach ($this->tableHandles as $handle) {
+            $handle->closeGenerationStreams();
+        }
+        $this->tableHandles = [];
+        $this->tableRevisions = [];
+        $this->bufferPool->clear();
+        $this->indexCache->clear();
+        $this->queryCache->clear();
+        if (is_resource($this->instanceLock)) {
+            @fclose($this->instanceLock);
+        }
+        $this->instanceLock = null;
     }
 
     public function listDatabases(): array
@@ -241,11 +258,11 @@ final class StorageEngine
                 }
                 throw new FoxyException("Table {$table} does not exist.", 'TABLE_NOT_FOUND');
             }
+            $this->closeTableHandle($database, $table);
             $tombstone = $path . '.dropping.' . bin2hex(random_bytes(6));
             if (!@rename($path, $tombstone)) {
                 throw new FoxyException('Unable to detach table directory.', 'STORAGE_IO');
             }
-            unset($this->tableHandles[$this->tableKey($database, $table)]);
             $this->indexCache->clear();
             $this->invalidateTableCaches($database, $table);
             FileSystem::removeTree($tombstone);
@@ -283,10 +300,10 @@ final class StorageEngine
             if (is_dir($newPath)) {
                 throw new FoxyException("Table {$newName} already exists.", 'TABLE_EXISTS');
             }
+            $this->closeTableHandle($database, $oldName);
             if (!@rename($oldPath, $newPath)) {
                 throw new FoxyException('Unable to rename table directory.', 'STORAGE_IO');
             }
-            unset($this->tableHandles[$this->tableKey($database, $oldName)]);
             $this->invalidateTableCaches($database, $oldName);
             $this->invalidateTableCaches($database, $newName);
         } finally {
@@ -336,10 +353,10 @@ final class StorageEngine
             if (is_dir($newPath)) {
                 throw new FoxyException("Table {$targetTable} already exists in target database.", 'TABLE_EXISTS');
             }
+            $this->closeTableHandle($database, $table);
             if (!@rename($oldPath, $newPath)) {
                 throw new FoxyException('Unable to move table directory.', 'STORAGE_IO');
             }
-            unset($this->tableHandles[$this->tableKey($database, $table)]);
             $this->invalidateTableCaches($database, $table);
             $this->invalidateTableCaches($targetDatabase, $targetTable);
         } finally {
@@ -469,12 +486,23 @@ final class StorageEngine
             );
             $this->tableHandles[$key] = $handle;
             if (count($this->tableHandles) > self::MAXIMUM_TABLE_HANDLES) {
+                $evicted = $this->tableHandles[array_key_first($this->tableHandles)];
                 unset($this->tableHandles[array_key_first($this->tableHandles)]);
+                $evicted->closeGenerationStreams();
                 $this->indexCache->clear();
             }
             return $handle;
         } finally {
             $this->releaseLock($catalogLock);
+        }
+    }
+
+    private function closeTableHandle(string $database, string $table): void
+    {
+        $key = $this->tableKey($database, $table);
+        if (isset($this->tableHandles[$key])) {
+            $this->tableHandles[$key]->closeGenerationStreams();
+            unset($this->tableHandles[$key]);
         }
     }
 

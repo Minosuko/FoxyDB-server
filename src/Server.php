@@ -21,6 +21,9 @@ final class Server
     private const MINIMUM_CLIENT_OUTPUT_BYTES = 1_048_576;
     private const OUTPUT_WRITE_BYTES = 262_144;
     private const OUTPUT_STALL_TIMEOUT_SECONDS = 30;
+    private const FIBER_START_BUDGET = 32;
+    private const FIBER_RESUME_BUDGET = 64;
+    private const ACCEPT_BUDGET = 32;
 
     private bool $running = false;
     private int $activeTransfers = 0;
@@ -32,6 +35,9 @@ final class Server
     private array $connectErrors = [];
     private array $readyFibers = [];
     private array $pendingFibers = [];
+    private int $pendingFiberOffset = 0;
+    private int $activeFibers = 0;
+    private int $nextIdleSweep = 0;
     private readonly StorageEngine $storage;
     private readonly Authentication $authentication;
     private readonly SystemVariables $systemVariables;
@@ -115,27 +121,28 @@ final class Server
             while ($this->running) {
                 $this->resumeReadyFibers();
                 $this->processPendingFibers();
-                $read = [$server];
+                $read = ['server' => $server];
                 $write = [];
-                foreach ($this->clients as $client) {
+                foreach ($this->clients as $clientId => $client) {
                     if (!$client['tls_ready']) {
-                        $read[] = $client['stream'];
+                        $read[$clientId] = $client['stream'];
                         if ($client['tls_retry_write']) {
-                            $write[] = $client['stream'];
+                            $write[$clientId] = $client['stream'];
                         }
                         continue;
                     }
                     if ($client['output_buffer'] !== '') {
-                        $write[] = $client['stream'];
+                        $write[$clientId] = $client['stream'];
                     }
-                    if ($client['output_buffer'] === '' && !$client['close_after_write']) {
-                        $read[] = $client['stream'];
+                    if ($client['output_buffer'] === '' && !$client['close_after_write']
+                        && !$client['query_active']) {
+                        $read[$clientId] = $client['stream'];
                     }
                 }
                 $writeSet = $write === [] ? null : $write;
                 $except = null;
-                $timeout = $this->readyFibers !== [] || $this->pendingFibers !== [] ? 0 : 1;
-                $selected = @stream_select($read, $writeSet, $except, $timeout);
+                [$seconds, $microseconds] = $this->selectTimeout();
+                $selected = @stream_select($read, $writeSet, $except, $seconds, $microseconds);
                 if ($selected === false) {
                     if (!$this->running) {
                         break;
@@ -143,30 +150,36 @@ final class Server
                     throw new FoxyException('TCP select failed.', 'SERVER_IO');
                 }
                 if ($selected > 0) {
-                    $processed = [];
-                    foreach (array_merge($writeSet ?? [], $read) as $stream) {
-                        if ($stream === $server) {
-                            $this->acceptClient($server);
+                    if (isset($read['server'])) {
+                        $this->acceptClient($server);
+                        unset($read['server']);
+                    }
+                    foreach ($writeSet ?? [] as $clientId => $stream) {
+                        if (!isset($this->clients[$clientId])) {
                             continue;
                         }
-                        $clientId = (int) $stream;
-                        if (isset($processed[$clientId]) || !isset($this->clients[$clientId])) {
-                            continue;
-                        }
-                        $processed[$clientId] = true;
                         if (!$this->clients[$clientId]['tls_ready']) {
-                            $this->progressTlsHandshake(
-                                $clientId,
-                                in_array($stream, $writeSet ?? [], true),
-                            );
-                        } elseif (in_array($stream, $writeSet ?? [], true)) {
+                            $this->progressTlsHandshake($clientId, true);
+                        } else {
                             $this->flushClientOutput($clientId);
-                        } elseif (in_array($stream, $read, true)) {
+                        }
+                    }
+                    foreach ($read as $clientId => $stream) {
+                        if (!isset($this->clients[$clientId])) {
+                            continue;
+                        }
+                        if (!$this->clients[$clientId]['tls_ready']) {
+                            $this->progressTlsHandshake($clientId, false);
+                        } else {
                             $this->readClient($clientId);
                         }
                     }
                 }
-                $this->disconnectIdleClients();
+                $now = time();
+                if ($now >= $this->nextIdleSweep) {
+                    $this->disconnectIdleClients($now);
+                    $this->nextIdleSweep = $now + 1;
+                }
             }
         } catch (\Throwable $exception) {
             $this->logger->error('server.loop_failed', [
@@ -189,33 +202,43 @@ final class Server
         $this->running = false;
     }
 
-    private function startFiber(int $clientId, array $request): void
+    private function scheduleQuery(int $clientId, array $request): void
     {
-        $context = ['clientId' => $clientId, 'request' => $request];
-        $fiber = new \Fiber(function () use ($context): void {
-            $this->handleRequest($context['clientId'], $context['request']);
-        });
-        $this->pendingFibers[] = ['fiber' => $fiber, 'clientId' => $clientId, 'started' => hrtime(true)];
+        if ($this->clients[$clientId]['query_active']) {
+            if (count($this->clients[$clientId]['query_queue']) >= $this->config->maxQueuedQueriesPerClient) {
+                throw new FoxyException('Too many queued queries for this connection.', 'RESOURCE_LIMIT');
+            }
+            $this->clients[$clientId]['query_queue'][] = $request;
+            return;
+        }
+        $this->clients[$clientId]['query_active'] = true;
+        $this->pendingFibers[] = ['clientId' => $clientId, 'request' => $request];
     }
 
-private function resumeReadyFibers(): void
+    private function resumeReadyFibers(): void
     {
         if ($this->readyFibers === []) {
             return;
         }
-        $snapshot = $this->readyFibers;
-        $this->readyFibers = [];
-        foreach ($snapshot as $entry) {
+        $now = hrtime(true);
+        $remaining = [];
+        $resumed = 0;
+        foreach ($this->readyFibers as $entry) {
             $fiber = $entry['fiber'];
             $clientId = $entry['clientId'];
             if (!isset($this->clients[$clientId])) {
+                $this->activeFibers = max(0, $this->activeFibers - 1);
                 continue;
             }
             if ($fiber->isTerminated()) {
                 continue;
             }
+            if ($entry['wake_at'] > $now || $resumed >= self::FIBER_RESUME_BUDGET) {
+                $remaining[] = $entry;
+                continue;
+            }
             try {
-                $fiber->resume();
+                $suspension = $fiber->resume();
             } catch (\Throwable $exception) {
                 if (isset($this->clients[$clientId])) {
                     $this->sendError(
@@ -227,26 +250,38 @@ private function resumeReadyFibers(): void
                 continue;
             }
             if ($fiber->isSuspended()) {
-                $this->readyFibers[] = ['fiber' => $fiber, 'clientId' => $clientId];
+                $remaining[] = $this->suspendedFiber($fiber, $clientId, $suspension);
             }
+            $resumed++;
         }
+        $this->readyFibers = $remaining;
     }
 
     private function processPendingFibers(): void
     {
-        if ($this->pendingFibers === []) {
+        if (!$this->hasPendingFibers()) {
             return;
         }
-        $pending = $this->pendingFibers;
-        $this->pendingFibers = [];
-        foreach ($pending as $entry) {
-            $fiber = $entry['fiber'];
+        $started = 0;
+        while ($this->hasPendingFibers()
+            && $this->activeFibers < $this->config->maxConcurrentQueries
+            && $started < self::FIBER_START_BUDGET) {
+            $entry = $this->pendingFibers[$this->pendingFiberOffset++];
             $clientId = $entry['clientId'];
             if (!isset($this->clients[$clientId])) {
                 continue;
             }
+            $request = $entry['request'];
+            $fiber = new \Fiber(function () use ($clientId, $request): void {
+                try {
+                    $this->handleRequest($clientId, $request);
+                } finally {
+                    $this->queryFinished($clientId);
+                }
+            });
+            $this->activeFibers++;
             try {
-                $fiber->start();
+                $suspension = $fiber->start();
             } catch (\Throwable $exception) {
                 if (isset($this->clients[$clientId])) {
                     $this->sendError(
@@ -258,24 +293,78 @@ private function resumeReadyFibers(): void
                 continue;
             }
             if ($fiber->isSuspended()) {
-                $this->readyFibers[] = ['fiber' => $fiber, 'clientId' => $clientId];
+                $this->readyFibers[] = $this->suspendedFiber($fiber, $clientId, $suspension);
             }
+            $started++;
+        }
+        if ($this->pendingFiberOffset >= count($this->pendingFibers)) {
+            $this->pendingFibers = [];
+            $this->pendingFiberOffset = 0;
+        } elseif ($this->pendingFiberOffset >= 1_024) {
+            $this->pendingFibers = array_slice($this->pendingFibers, $this->pendingFiberOffset);
+            $this->pendingFiberOffset = 0;
         }
     }
 
     public static function fiberYield(?int $delayMicroseconds = null): void
     {
         if (\Fiber::getCurrent() !== null) {
-            \Fiber::suspend();
+            \Fiber::suspend(['delay_us' => max(0, $delayMicroseconds ?? 0)]);
+            return;
         }
         if ($delayMicroseconds !== null && $delayMicroseconds > 0) {
             usleep($delayMicroseconds);
         }
     }
 
+    private function suspendedFiber(\Fiber $fiber, int $clientId, mixed $suspension): array
+    {
+        $delay = is_array($suspension) ? (int) ($suspension['delay_us'] ?? 0) : 0;
+        return [
+            'fiber' => $fiber,
+            'clientId' => $clientId,
+            'wake_at' => hrtime(true) + max(0, $delay) * 1_000,
+        ];
+    }
+
+    private function queryFinished(int $clientId): void
+    {
+        $this->activeFibers = max(0, $this->activeFibers - 1);
+        if (!isset($this->clients[$clientId])) {
+            return;
+        }
+        $next = array_shift($this->clients[$clientId]['query_queue']);
+        if (is_array($next)) {
+            $this->pendingFibers[] = ['clientId' => $clientId, 'request' => $next];
+            return;
+        }
+        $this->clients[$clientId]['query_active'] = false;
+    }
+
+    private function selectTimeout(): array
+    {
+        if ($this->hasPendingFibers() && $this->activeFibers < $this->config->maxConcurrentQueries) {
+            return [0, 0];
+        }
+        if ($this->readyFibers === []) {
+            return [1, 0];
+        }
+        $wakeAt = min(array_column($this->readyFibers, 'wake_at'));
+        $remaining = max(0, $wakeAt - hrtime(true));
+        return [0, min(100_000, (int) ceil($remaining / 1_000))];
+    }
+
+    private function hasPendingFibers(): bool
+    {
+        return $this->pendingFiberOffset < count($this->pendingFibers);
+    }
+
     private function acceptClient($server): void
     {
-        while (($stream = @stream_socket_accept($server, 0, $peer)) !== false) {
+        $accepted = 0;
+        while ($accepted < self::ACCEPT_BUDGET
+            && ($stream = @stream_socket_accept($server, 0, $peer)) !== false) {
+            $accepted++;
             if (count($this->clients) >= $this->config->maxConnections) {
                 $this->logger->audit('connection.rejected', [
                     'peer' => $peer,
@@ -311,6 +400,7 @@ private function resumeReadyFibers(): void
                 'peer_name' => $peerName,
                 'buffer' => '',
                 'output_buffer' => '',
+                'output_offset' => 0,
                 'output_since' => null,
                 'close_after_write' => false,
                 'close_reason' => null,
@@ -323,6 +413,8 @@ private function resumeReadyFibers(): void
                 'peer_frame_bytes' => null,
                 'peer_chunk_bytes' => null,
                 'transfers' => [],
+                'query_active' => false,
+                'query_queue' => [],
                 'last_activity' => time(),
                 'connected_at' => time(),
             ];
@@ -431,7 +523,7 @@ private function resumeReadyFibers(): void
                 $this->clients[$clientId]['last_activity'] = time();
                 $requestType = $request['type'] ?? null;
                 if ($requestType === 'query' && class_exists(\Fiber::class)) {
-                    $this->startFiber($clientId, $request);
+                    $this->scheduleQuery($clientId, $request);
                 } else {
                     $this->handleRequest($clientId, $request);
                 }
@@ -1112,7 +1204,8 @@ private function resumeReadyFibers(): void
             throw new FoxyException('Unable to write to the client.', 'CONNECTION_IO');
         }
 
-        $clientBytes = strlen($this->clients[$clientId]['output_buffer']);
+        $clientBytes = strlen($this->clients[$clientId]['output_buffer'])
+            - $this->clients[$clientId]['output_offset'];
         $dataBytes = strlen($data);
         if ($dataBytes > $this->clientOutputLimit($clientId) - $clientBytes
             || $dataBytes > $this->outputBufferLimit() - $this->queuedOutputBytes) {
@@ -1135,11 +1228,14 @@ private function resumeReadyFibers(): void
             return false;
         }
         $buffer = $this->clients[$clientId]['output_buffer'];
-        if ($buffer === '') {
+        $offset = $this->clients[$clientId]['output_offset'];
+        if ($buffer === '' || $offset >= strlen($buffer)) {
+            $this->clients[$clientId]['output_buffer'] = '';
+            $this->clients[$clientId]['output_offset'] = 0;
             return true;
         }
         $stream = $this->clients[$clientId]['stream'];
-        $written = @fwrite($stream, substr($buffer, 0, self::OUTPUT_WRITE_BYTES));
+        $written = @fwrite($stream, substr($buffer, $offset, self::OUTPUT_WRITE_BYTES));
         if ($written === false) {
             $this->disconnect($clientId, 'write_failed');
             return false;
@@ -1152,13 +1248,20 @@ private function resumeReadyFibers(): void
             return true;
         }
 
-        $this->clients[$clientId]['output_buffer'] = substr($buffer, $written);
+        $offset += $written;
+        $this->clients[$clientId]['output_offset'] = $offset;
         $this->queuedOutputBytes = max(0, $this->queuedOutputBytes - $written);
         $this->clients[$clientId]['last_activity'] = time();
-        if ($this->clients[$clientId]['output_buffer'] !== '') {
+        if ($offset < strlen($buffer)) {
+            if ($offset >= 1_048_576 && $offset >= intdiv(strlen($buffer), 2)) {
+                $this->clients[$clientId]['output_buffer'] = substr($buffer, $offset);
+                $this->clients[$clientId]['output_offset'] = 0;
+            }
             $this->clients[$clientId]['output_since'] = time();
             return true;
         }
+        $this->clients[$clientId]['output_buffer'] = '';
+        $this->clients[$clientId]['output_offset'] = 0;
         $this->clients[$clientId]['output_since'] = null;
         if ($closeWhenDrained && $this->clients[$clientId]['close_after_write']) {
             $reason = $this->clients[$clientId]['close_reason'] ?? 'closed_after_write';
@@ -1191,7 +1294,7 @@ private function resumeReadyFibers(): void
         }
     }
 
-    private function disconnectIdleClients(): void
+    private function disconnectIdleClients(int $now): void
     {
         foreach ($this->clients as $id => $client) {
             $connectTimeout = (int) $this->systemVariables->get('connect_timeout');
@@ -1199,12 +1302,12 @@ private function resumeReadyFibers(): void
                 ? (int) ($client['session']?->variable('interactive_timeout', 300) ?? 300)
                 : (int) ($client['session']?->variable('wait_timeout', 300) ?? 300);
             if ($client['output_buffer'] !== '' && $client['output_since'] !== null
-                && $client['output_since'] <= time() - self::OUTPUT_STALL_TIMEOUT_SECONDS) {
+                && $client['output_since'] <= $now - self::OUTPUT_STALL_TIMEOUT_SECONDS) {
                 $this->disconnect($id, 'write_timeout');
-            } elseif ((!$client['tls_ready'] && $client['connected_at'] < time() - $connectTimeout)
+            } elseif ((!$client['tls_ready'] && $client['connected_at'] < $now - $connectTimeout)
                 || ($client['tls_ready'] && !$client['authenticated']
-                    && $client['connected_at'] < time() - $connectTimeout)
-                || $client['last_activity'] < time() - $idleTimeout) {
+                    && $client['connected_at'] < $now - $connectTimeout)
+                || (!$client['query_active'] && $client['last_activity'] < $now - $idleTimeout)) {
                 $this->disconnect($id, 'timeout');
             }
         }
@@ -1223,9 +1326,17 @@ private function resumeReadyFibers(): void
         }
         $session = $this->clients[$clientId]['session'];
         if ($session instanceof Session) {
-            $session->resetAuthentication();
-            if (count($this->sessionCache) < (int) $this->systemVariables->get('thread_cache_size')) {
-                $this->sessionCache[] = $session;
+            try {
+                $session->resetAuthentication();
+                if (!$this->clients[$clientId]['query_active']
+                    && count($this->sessionCache) < (int) $this->systemVariables->get('thread_cache_size')) {
+                    $this->sessionCache[] = $session;
+                }
+            } catch (\Throwable $exception) {
+                $this->logger->error('session.reset_failed', $context + [
+                    'exception' => $exception::class,
+                    'message' => $exception->getMessage(),
+                ]);
             }
         }
         $stream = $this->clients[$clientId]['stream'];
@@ -1235,7 +1346,9 @@ private function resumeReadyFibers(): void
         );
         $this->queuedOutputBytes = max(
             0,
-            $this->queuedOutputBytes - strlen($this->clients[$clientId]['output_buffer']),
+            $this->queuedOutputBytes
+                - (strlen($this->clients[$clientId]['output_buffer'])
+                    - $this->clients[$clientId]['output_offset']),
         );
         unset($this->clients[$clientId]);
         if (is_resource($stream)) {

@@ -78,7 +78,7 @@ final class ChunkStore
             }
         }
 
-        if (is_string($value) && in_array($type, ['TEXT', 'LONGTEXT'], true)
+        if (is_string($value) && in_array($type, ['TEXT', 'LONGTEXT', 'JSON'], true)
             && strlen($value) > $this->config->inlineValueBytes) {
             $stream = fopen('php://temp', 'w+b');
             if ($stream === false) {

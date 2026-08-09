@@ -56,6 +56,8 @@ final class SysTable
         }
 
         $rows[] = ['variable_name' => 'max_connections', 'value' => (string) $config->maxConnections];
+        $rows[] = ['variable_name' => 'max_concurrent_queries', 'value' => (string) $config->maxConcurrentQueries];
+        $rows[] = ['variable_name' => 'max_queued_queries_per_client', 'value' => (string) $config->maxQueuedQueriesPerClient];
         $rows[] = ['variable_name' => 'max_frame_bytes', 'value' => (string) $config->maxFrameBytes];
         $rows[] = ['variable_name' => 'idle_timeout_seconds', 'value' => (string) $config->idleTimeoutSeconds];
 

@@ -42,7 +42,8 @@ try {
         || $parser->cacheStatistics()['hits'] < 1) {
         throw new RuntimeException('Repeated SQL text did not use the parsed-statement cache.');
     }
-    $session = new Session(new StorageEngine($config), $config);
+    $storage = new StorageEngine($config);
+    $session = new Session($storage, $config);
     $session->execute('CREATE DATABASE app');
     $session->execute('USE app');
 
@@ -247,6 +248,9 @@ try {
         }
     }
     if (is_dir($directory)) {
+        if (isset($storage)) {
+            $storage->close();
+        }
         FileSystem::removeTree($directory);
     }
 }

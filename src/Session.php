@@ -416,7 +416,7 @@ $groupColumns = $statement['group'] ?? [];
 
         $countProjection = false;
         $aliases = [];
-        foreach ($projections as $projection) {
+        foreach ($projections as &$projection) {
             if ($projection['kind'] === 'column') {
                 if ($hasGroup && !in_array($projection['column'], $groupColumns, true)) {
                     throw new FoxyException(
@@ -426,6 +426,22 @@ $groupColumns = $statement['group'] ?? [];
                 if (!$hasGroup && !isset($columns[$projection['column']])) {
                     throw new FoxyException("Unknown column: {$projection['column']}", 'UNKNOWN_COLUMN');
                 }
+            } elseif ($projection['kind'] === 'json_extract') {
+                if ($hasGroup) {
+                    throw new FoxyException('Unsupported projection with GROUP BY.', 'SQL_SEMANTIC');
+                }
+                $parts = explode('.', $projection['column']);
+                $base = count($parts) === 2 ? $parts[1] : $projection['column'];
+                if (!isset($columns[$base])) {
+                    throw new FoxyException("Unknown column: {$projection['column']}", 'UNKNOWN_COLUMN');
+                }
+                $pathValue = $projection['path']['kind'] === 'parameter'
+                    ? $this->value($projection['path'], $parameters)
+                    : $projection['path']['value'];
+                if (!is_string($pathValue)) {
+                    throw new FoxyException('JSON_EXTRACT requires a string path.', 'SQL_SEMANTIC');
+                }
+                $projection['json_tokens'] = self::compileJsonPath($pathValue);
             } elseif (!$hasGroup && $projection['kind'] === 'count') {
                 $countProjection = true;
             }
@@ -434,6 +450,7 @@ $groupColumns = $statement['group'] ?? [];
             }
             $aliases[$projection['alias']] = true;
         }
+        unset($projection);
         if (!$hasGroup && $countProjection && count($projections) !== 1) {
             throw new FoxyException('COUNT(*) cannot be mixed with non-aggregate columns.', 'SQL_SEMANTIC');
         }
@@ -588,15 +605,36 @@ $groupColumns = $statement['group'] ?? [];
 
         $countProjection = false;
         $projAliasesCheck = [];
-        foreach ($projections as $projection) {
+        foreach ($projections as &$projection) {
             if ($projection['kind'] === 'count') {
                 $countProjection = true;
+            } elseif ($projection['kind'] === 'json_extract') {
+                $parts = explode('.', $projection['column']);
+                $base = count($parts) === 2 ? $parts[1] : $projection['column'];
+                $found = false;
+                foreach ($columnMaps as $map) {
+                    if (isset($map[$base])) {
+                        $found = true;
+                        break;
+                    }
+                }
+                if (!$found) {
+                    throw new FoxyException("Unknown column: {$projection['column']}", 'UNKNOWN_COLUMN');
+                }
+                $pathValue = $projection['path']['kind'] === 'parameter'
+                    ? $this->value($projection['path'], $parameters)
+                    : $projection['path']['value'];
+                if (!is_string($pathValue)) {
+                    throw new FoxyException('JSON_EXTRACT requires a string path.', 'SQL_SEMANTIC');
+                }
+                $projection['json_tokens'] = self::compileJsonPath($pathValue);
             }
             if (isset($projAliasesCheck[$projection['alias']])) {
                 throw new FoxyException("Duplicate result column: {$projection['alias']}", 'SQL_SEMANTIC');
             }
             $projAliasesCheck[$projection['alias']] = true;
         }
+        unset($projection);
         if ($countProjection && count($projections) !== 1) {
             throw new FoxyException('COUNT(*) cannot be mixed with non-aggregate columns.', 'SQL_SEMANTIC');
         }
@@ -777,6 +815,12 @@ $groupColumns = $statement['group'] ?? [];
                 $groups[$groupKey]['accumulators'][$i] = $agg['accumulate'](
                     $groups[$groupKey]['accumulators'][$i], $value,
                 );
+            }
+        }
+        if ($groups === [] && $groupColumns === [] && $aggregators !== []) {
+            $groups[''] = ['row' => [], 'accumulators' => []];
+            foreach ($aggregators as $alias => $aggregator) {
+                $groups['']['accumulators'][$alias] = $aggregator['init']();
             }
         }
 
@@ -1848,6 +1892,25 @@ $groupColumns = $statement['group'] ?? [];
                 'value' => $value,
             ];
         }
+        if ($node['kind'] === 'call' && $node['name'] === 'json_extract') {
+            $operand = $this->operand($node['operand'], $columns, $parameters);
+            $pathValue = $node['path']['kind'] === 'parameter'
+                ? $this->value($node['path'], $parameters)
+                : $node['path']['value'];
+            if (!is_string($pathValue)) {
+                throw new FoxyException('JSON_EXTRACT requires a string path.', 'SQL_SEMANTIC');
+            }
+            $tokens = self::compileJsonPath($pathValue);
+            return [
+                'get' => function (array $row) use ($operand, $tokens): mixed {
+                    $raw = $this->types->materialize(($operand['get'])($row));
+                    return self::extractJson($raw, $tokens);
+                },
+                'constant' => false,
+                'column' => null,
+                'value' => null,
+            ];
+        }
         $value = $this->value($node, $parameters);
         return [
             'get' => static fn(array $row): mixed => $value,
@@ -1950,6 +2013,86 @@ $groupColumns = $statement['group'] ?? [];
         throw new FoxyException('DEFAULT is not valid in this context.', 'SQL_SEMANTIC');
     }
 
+    private static function compileJsonPath(string $path): array
+    {
+        if (preg_match('/\A\$/', $path) !== 1) {
+            throw new FoxyException('JSON path must start with $.', 'SQL_SEMANTIC');
+        }
+        $tokens = [];
+        $length = strlen($path);
+        $offset = 1;
+        while ($offset < $length) {
+            $char = $path[$offset];
+            if ($char === '.') {
+                $offset++;
+                $start = $offset;
+                while ($offset < $length && $path[$offset] !== '.' && $path[$offset] !== '[') {
+                    $offset++;
+                }
+                $key = substr($path, $start, $offset - $start);
+                if ($key === '') {
+                    throw new FoxyException('Invalid JSON path syntax.', 'SQL_SEMANTIC');
+                }
+                $tokens[] = ['kind' => 'key', 'value' => $key];
+            } elseif ($char === '[') {
+                $close = strpos($path, ']', $offset);
+                if ($close === false || $close === $offset + 1) {
+                    throw new FoxyException('Invalid JSON path syntax.', 'SQL_SEMANTIC');
+                }
+                $inner = substr($path, $offset + 1, $close - $offset - 1);
+                if (($inner[0] === "'" || $inner[0] === '"')
+                    && strlen($inner) >= 2 && substr($inner, -1) === $inner[0]
+                    && !str_contains(substr($inner, 1, -1), $inner[0])) {
+                    $tokens[] = ['kind' => 'key', 'value' => substr($inner, 1, -1)];
+                } elseif (preg_match('/\A\d+\z/', $inner) === 1) {
+                    $tokens[] = ['kind' => 'index', 'value' => (int) $inner];
+                } else {
+                    throw new FoxyException('Invalid JSON path syntax.', 'SQL_SEMANTIC');
+                }
+                $offset = $close + 1;
+            } else {
+                throw new FoxyException('Invalid JSON path syntax.', 'SQL_SEMANTIC');
+            }
+        }
+        if ($tokens === []) {
+            throw new FoxyException('Invalid JSON path syntax.', 'SQL_SEMANTIC');
+        }
+        return $tokens;
+    }
+
+    private static function extractJson(mixed $raw, array $tokens): mixed
+    {
+        if ($raw === null || $raw === '') {
+            return null;
+        }
+        if ($raw instanceof \FoxyDB\Value\BinaryValue) {
+            $raw = $raw->bytes;
+        }
+        try {
+            $decoded = json_decode((string) $raw, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException) {
+            return null;
+        }
+        $current = $decoded;
+        foreach ($tokens as $token) {
+            if ($current === null) {
+                return null;
+            }
+            if ($token['kind'] === 'key') {
+                if (!is_array($current) || !array_key_exists($token['value'], $current)) {
+                    return null;
+                }
+                $current = $current[$token['value']];
+            } else {
+                if (!is_array($current) || !array_key_exists($token['value'], $current)) {
+                    return null;
+                }
+                $current = $current[$token['value']];
+            }
+        }
+        return $current;
+    }
+
     private function normalizeParameter(mixed $value): mixed
     {
         return $value;
@@ -1986,6 +2129,17 @@ $groupColumns = $statement['group'] ?? [];
         foreach ($projections as $projection) {
             if ($projection['kind'] === 'value') {
                 $result[$projection['alias']] = $projection['value']['value'] ?? null;
+            } elseif ($projection['kind'] === 'json_extract') {
+                $column = $projection['column'];
+                $parts = explode('.', $column);
+                $base = count($parts) === 2 ? $parts[1] : $column;
+                $raw = $this->types->materialize(
+                    array_key_exists($base, $row) ? $row[$base] : ($row[$column] ?? null),
+                );
+                $extracted = self::extractJson($raw, $projection['json_tokens']);
+                $result[$projection['alias']] = is_array($extracted)
+                    ? json_encode($extracted, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+                    : $extracted;
             } else {
                 $column = $projection['column'];
                 $parts = explode('.', $column);
@@ -2189,10 +2343,18 @@ $groupColumns = $statement['group'] ?? [];
 
     public function resetAuthentication(): void
     {
-        $this->currentDatabase = null;
-        $this->username = null;
-        $this->accountId = null;
-        $this->sessionVariables = [];
+        try {
+            if ($this->inTransaction) {
+                $this->rollbackTransaction();
+            }
+        } finally {
+            $this->txnUndo = [];
+            $this->inTransaction = false;
+            $this->currentDatabase = null;
+            $this->username = null;
+            $this->accountId = null;
+            $this->sessionVariables = [];
+        }
     }
 
     private function systemValue(string $name, int|string|bool $fallback): int|string|bool

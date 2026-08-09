@@ -8,8 +8,8 @@ use FoxyDB\Exception\FoxyException;
 
 final class Lexer
 {
-    private const MAXIMUM_SQL_BYTES = 1_048_576;
-    private const MAXIMUM_TOKENS = 100_000;
+    private const MAXIMUM_SQL_BYTES = 16_777_216;
+    private const MAXIMUM_TOKENS = 1_000_000;
     private int $offset = 0;
     private int $line = 1;
     private int $column = 1;
@@ -19,7 +19,7 @@ final class Lexer
     {
         $this->length = strlen($sql);
         if ($this->length > self::MAXIMUM_SQL_BYTES) {
-            throw new FoxyException('SQL text exceeds the 1 MiB limit.', 'SQL_TOO_LARGE');
+            throw new FoxyException('SQL text exceeds the 16 MiB limit.', 'SQL_TOO_LARGE');
         }
     }
 

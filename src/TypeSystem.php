@@ -15,7 +15,7 @@ final class TypeSystem
 {
     private const TYPES = [
         'INT', 'VARCHAR', 'BIGINT', 'LONGTEXT', 'TEXT', 'BINARY', 'BLOB', 'TIMESTAMP',
-        'DATETIME', 'FLOAT', 'DOUBLE', 'BOOLEAN', 'REAL', 'TINYINT', 'UUID',
+        'DATETIME', 'FLOAT', 'DOUBLE', 'BOOLEAN', 'REAL', 'TINYINT', 'UUID', 'JSON',
     ];
     private const MAXIMUM_COLUMNS = 1_024;
     private const MAXIMUM_INDEX_KEY_BYTES = 4_096;
@@ -94,7 +94,7 @@ final class TypeSystem
                 if (!isset($columns[$columnName])) {
                     throw new FoxyException("Unknown indexed column: {$columnName}", 'SCHEMA_ERROR');
                 }
-                if (in_array($columns[$columnName]['type'], ['TEXT', 'LONGTEXT', 'BLOB'], true)) {
+                if (in_array($columns[$columnName]['type'], ['TEXT', 'LONGTEXT', 'BLOB', 'JSON'], true)) {
                     throw new FoxyException(
                         "Column {$columnName} uses a type that cannot be indexed.",
                         'SCHEMA_ERROR',
@@ -223,7 +223,7 @@ final class TypeSystem
             if (!isset($columnMap[$colName])) {
                 throw new FoxyException("Unknown indexed column: {$colName}", 'SCHEMA_ERROR');
             }
-            if (in_array($columnMap[$colName]['type'], ['TEXT', 'LONGTEXT', 'BLOB'], true)) {
+            if (in_array($columnMap[$colName]['type'], ['TEXT', 'LONGTEXT', 'BLOB', 'JSON'], true)) {
                 throw new FoxyException("Column {$colName} cannot be indexed.", 'SCHEMA_ERROR');
             }
         }
@@ -318,6 +318,7 @@ final class TypeSystem
             'TIMESTAMP' => $this->timestamp($value, true, $column['name']),
             'DATETIME' => $this->timestamp($value, false, $column['name']),
             'UUID' => $this->uuid($value, $column['name']),
+            'JSON' => $this->json($value, $column['name']),
             default => throw new FoxyException("Unsupported data type: {$type}", 'SCHEMA_ERROR'),
         };
     }
@@ -600,6 +601,26 @@ final class TypeSystem
             $date = $date->setTimezone(new DateTimeZone('UTC'));
         }
         return $date->format('Y-m-d H:i:s.u');
+    }
+
+    private function json(mixed $value, string $name): string
+    {
+        if (is_array($value) || is_int($value) || is_float($value) || is_bool($value)) {
+            $decoded = $value;
+        } elseif (is_string($value)) {
+            try {
+                $decoded = json_decode($value, true, 512, JSON_THROW_ON_ERROR);
+            } catch (\JsonException $exception) {
+                throw new FoxyException("Value for {$name} is not valid JSON.", 'INVALID_VALUE', [], $exception);
+            }
+        } else {
+            throw new FoxyException("Value for {$name} is not valid JSON.", 'INVALID_VALUE');
+        }
+        $encoded = json_encode($decoded, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($encoded === false) {
+            throw new FoxyException("Value for {$name} is not valid JSON.", 'INVALID_VALUE');
+        }
+        return $encoded;
     }
 
     private function uuid(mixed $value, string $name): string

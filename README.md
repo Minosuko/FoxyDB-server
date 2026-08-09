@@ -10,9 +10,10 @@ For SQLite-style deployment without a daemon or network connection, use the [`Mi
 
 - TCP server on `127.0.0.1:2002` by default
 - TLS 1.2 and TLS 1.3 encryption on every network connection
-- SQL lexer, parser, typed AST, and execution engine
-- `INT`, `VARCHAR`, `BIGINT`, `LONGTEXT`, `TEXT`, `BINARY`, `BLOB`, `TIMESTAMP`, `DATETIME`, `FLOAT`, `DOUBLE`, `BOOLEAN`, `REAL`, `TINYINT`, and `UUID`
+- SQL lexer, parser, typed AST, and execution engine (statements up to 16 MiB and 1,000,000 tokens)
+- `INT`, `VARCHAR`, `BIGINT`, `LONGTEXT`, `TEXT`, `BINARY`, `BLOB`, `TIMESTAMP`, `DATETIME`, `FLOAT`, `DOUBLE`, `BOOLEAN`, `REAL`, `TINYINT`, `UUID`, and `JSON`
 - Primary, unique, and non-unique hash indexes
+- `JSON` columns with `JSON_EXTRACT` predicates and projections
 - `AUTO_INCREMENT` integer keys
 - Append-only row data with fixed-size row directory slots
 - Checksummed records, redo slots, dirty-index recovery, and generation fallback
@@ -304,9 +305,17 @@ CREATE TABLE events (
 );
 ```
 
-`BINARY(n)` is fixed width and zero-pads shorter inline values. `TIMESTAMP` is normalized to UTC. `DATETIME` stores a timezone-free date and time. UUID values are validated and stored in lowercase.
+`BINARY(n)` is fixed width and zero-pads shorter inline values. `TIMESTAMP` is normalized to UTC. `DATETIME` stores a timezone-free date and time. UUID values are validated and stored in lowercase. `JSON` columns validate and canonicalize their input; large JSON documents use the deduplicated chunk store like `LONGTEXT`.
 
-Indexes have a maximum encoded key size of 4096 bytes. `TEXT`, `LONGTEXT`, and `BLOB` cannot be indexed. Equality predicates can use a complete matching hash index. Range and pattern predicates use bounded-memory table scans.
+`JSON_EXTRACT(column, path)` evaluates a JSON path such as `$.status`, `$.meta.rating`, or `$.items[2]` (bracket forms like `$['status']` are also accepted). It can appear in `WHERE`, `HAVING`, and `SELECT` projections, and returns `NULL` when the path does not exist or the operand is not valid JSON. Use `JSON_EXTRACT` in `SELECT` to project a JSON member, or in `WHERE` to filter on extracted values:
+
+```sql
+SELECT JSON_EXTRACT(doc, '$.profile.email') AS email
+FROM contacts
+WHERE JSON_EXTRACT(doc, '$.status') = 'active';
+```
+
+Indexes have a maximum encoded key size of 4096 bytes. `TEXT`, `LONGTEXT`, `BLOB`, and `JSON` cannot be indexed. Equality predicates can use a complete matching hash index. Range and pattern predicates use bounded-memory table scans.
 
 ## Wire Protocol
 

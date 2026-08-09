@@ -62,6 +62,9 @@ try {
 
     echo "authentication: ok\n";
 } finally {
+    if (isset($storage)) {
+        $storage->close();
+    }
     if (is_dir($directory)) {
         FileSystem::removeTree($directory);
     }

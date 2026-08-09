@@ -18,6 +18,9 @@ final class Table
     private const SLOT_ACTIVE = 1;
     private const SLOT_DELETED = 2;
     private const RECORD_COMPRESSED = 1;
+    private const JOURNAL_MAX_ENTRIES = 24_000;
+    private const JOURNAL_MAX_PARTS = 96;
+    private const SLOT_CACHE_ENTRIES = 16_384;
 
     private readonly TypeSystem $types;
     private readonly ChunkStore $chunks;
@@ -26,6 +29,10 @@ final class Table
     private ?array $metadataCache = null;
     private array $indexStores = [];
     private ?\Closure $undoCallback = null;
+    private ?int $streamsGeneration = null;
+    private $streamsData = null;
+    private $streamsSlots = null;
+    private array $slotCache = [];
 
     public function __construct(
         private readonly string $path,
@@ -175,9 +182,16 @@ final class Table
             }
             unset($entry);
             $this->writeSequence($nextRowId, $nextAuto);
+            $batchChanges = [];
             foreach ($prepared as $entry) {
-                $this->storeRowLocked($schema, $entry['row_id'], $entry['row'], null, $entry['record']);
+                $batchChanges[] = [
+                    'row_id' => $entry['row_id'],
+                    'old' => null,
+                    'new' => $entry['row'],
+                    'record' => $entry['record'],
+                ];
             }
+            $this->commitRowsLocked($schema, $batchChanges);
             foreach ($prepared as &$entry) {
                 unset($entry['record']);
             }
@@ -476,17 +490,18 @@ final class Table
                 }
                 $this->writeSequence($nextRowId, $nextAuto);
             }
+            $batchChanges = [];
             foreach ($changes as $change) {
                 if ($change['new'] !== $change['old']) {
-                    $this->storeRowLocked(
-                        $schema,
-                        $change['id'],
-                        $change['new'],
-                        $change['old'],
-                        $change['record'],
-                    );
+                    $batchChanges[] = [
+                        'row_id' => $change['id'],
+                        'old' => $change['old'],
+                        'new' => $change['new'],
+                        'record' => $change['record'],
+                    ];
                 }
             }
+            $this->commitRowsLocked($schema, $batchChanges);
             return count($changes);
         } finally {
             $this->releaseLock($lock);
@@ -518,9 +533,16 @@ final class Table
                     throw new FoxyException('DELETE exceeded the configured mutation row limit.', 'RESOURCE_LIMIT');
                 }
             }
+            $batchChanges = [];
             foreach ($deletions as $entry) {
-                $this->deleteRowLocked($schema, $entry['id'], $entry['values']);
+                $batchChanges[] = [
+                    'row_id' => $entry['id'],
+                    'old' => $entry['values'],
+                    'new' => null,
+                    'record' => null,
+                ];
             }
+            $this->commitRowsLocked($schema, $batchChanges);
             return count($deletions);
         } finally {
             $this->releaseLock($lock);
@@ -582,7 +604,7 @@ final class Table
                 if (!isset($columnMap[$columnName])) {
                     throw new FoxyException("Unknown column: {$columnName}", 'UNKNOWN_COLUMN');
                 }
-                if (in_array($columnMap[$columnName]['type'], ['TEXT', 'LONGTEXT', 'BLOB'], true)) {
+                if (in_array($columnMap[$columnName]['type'], ['TEXT', 'LONGTEXT', 'BLOB', 'JSON'], true)) {
                     throw new FoxyException("Column {$columnName} cannot be indexed.", 'SCHEMA_ERROR');
                 }
             }
@@ -659,6 +681,7 @@ final class Table
             $schema = $this->loadMetadata();
             $oldGeneration = $this->generationPath($schema);
             $obsoleteGeneration = $schema['previous_generation'] ?? null;
+            $this->closeGenerationStreams();
             $number = $this->nextGenerationNumber();
             $newGeneration = $this->path . DIRECTORY_SEPARATOR . self::generationName($number);
             self::initializeGeneration($newGeneration, array_keys($schema['indexes']), $this->config);
@@ -696,6 +719,7 @@ final class Table
             $schema = $this->loadMetadata();
             $oldGeneration = $this->generationPath($schema);
             $obsoleteGeneration = $schema['previous_generation'] ?? null;
+            $this->closeGenerationStreams();
             $number = $this->nextGenerationNumber();
             $temporary = $this->path . DIRECTORY_SEPARATOR . self::generationName($number) . '.compacting';
             $published = $this->path . DIRECTORY_SEPARATOR . self::generationName($number);
@@ -976,6 +1000,7 @@ final class Table
 
                 $oldGeneration = $this->generationPath($schema);
                 $obsoleteGeneration = $schema['previous_generation'] ?? null;
+                $this->closeGenerationStreams();
                 $number = $this->nextGenerationNumber();
                 $temporary = $this->path . DIRECTORY_SEPARATOR . self::generationName($number) . '.compacting';
                 $published = $this->path . DIRECTORY_SEPARATOR . self::generationName($number);
@@ -1142,32 +1167,55 @@ final class Table
             $this->storeMetadata($schema);
         }
         $rebuildIndexes = false;
-        if (is_file($this->journalPath())) {
-            $journal = FileSystem::readMetadata($this->journalPath());
+        $journalPaths = [];
+        for ($part = 0; $part < self::JOURNAL_MAX_PARTS; $part++) {
+            $path = $this->journalPath($part);
+            if (!is_file($path)) {
+                break;
+            }
+            $journalPaths[] = $path;
+        }
+        foreach ($journalPaths as $journalPath) {
+            $journal = FileSystem::readMetadata($journalPath);
             $generation = $journal['generation'] ?? null;
-            $rowId = $journal['row_id'] ?? null;
-            $slot = $journal['slot'] ?? null;
-            if (!is_int($generation) || !is_int($rowId) || $rowId < 1
-                || !is_string($slot) || strlen($slot) !== self::SLOT_BYTES) {
+            if (array_key_exists('entries', $journal)) {
+                $entries = $journal['entries'];
+                if (!is_array($entries) || !array_is_list($entries)) {
+                    throw new FoxyException('Invalid row journal.', 'STORAGE_CORRUPT');
+                }
+            } elseif (is_int($journal['row_id'] ?? null) && is_string($journal['slot'] ?? null)) {
+                $entries = [['row_id' => $journal['row_id'], 'slot' => $journal['slot']]];
+            } else {
+                throw new FoxyException('Invalid row journal.', 'STORAGE_CORRUPT');
+            }
+            if (!is_int($generation) || $entries === []) {
                 throw new FoxyException('Invalid row journal.', 'STORAGE_CORRUPT');
             }
             if ($missingGeneration !== null && $generation === $missingGeneration) {
-                if (!@unlink($this->journalPath())) {
+                if (!@unlink($journalPath)) {
                     throw new FoxyException('Unable to discard unavailable generation journal.', 'STORAGE_IO');
                 }
                 $rebuildIndexes = true;
-            } elseif ($generation !== (int) $schema['active_generation']) {
+                continue;
+            }
+            if ($generation !== (int) $schema['active_generation']) {
                 throw new FoxyException('Invalid row journal generation.', 'STORAGE_CORRUPT');
-            } else {
-                $journalSlot = $this->decodeSlotBytes($slot);
-                $slotBytes = filesize($this->generationPath($schema) . DIRECTORY_SEPARATOR . 'rows.fdx');
-                if ($slotBytes === false || $slotBytes % self::SLOT_BYTES !== 0) {
-                    throw new FoxyException('Row slot file has an invalid length.', 'STORAGE_CORRUPT');
+            }
+            $slotBytes = filesize($this->generationPath($schema) . DIRECTORY_SEPARATOR . 'rows.fdx');
+            if ($slotBytes === false || $slotBytes % self::SLOT_BYTES !== 0) {
+                throw new FoxyException('Row slot file has an invalid length.', 'STORAGE_CORRUPT');
+            }
+            $allocatedRows = intdiv($slotBytes, self::SLOT_BYTES);
+            $maximumAllowed = $allocatedRows > PHP_INT_MAX - $this->config->maxRowsPerResult - 1
+                ? PHP_INT_MAX
+                : $allocatedRows + $this->config->maxRowsPerResult + 1;
+            foreach ($entries as $entry) {
+                $rowId = $entry['row_id'] ?? null;
+                $slot = $entry['slot'] ?? null;
+                if (!is_int($rowId) || $rowId < 1 || !is_string($slot) || strlen($slot) !== self::SLOT_BYTES) {
+                    throw new FoxyException('Invalid row journal.', 'STORAGE_CORRUPT');
                 }
-                $allocatedRows = intdiv($slotBytes, self::SLOT_BYTES);
-                $maximumAllowed = $allocatedRows > PHP_INT_MAX - $this->config->maxRowsPerResult - 1
-                    ? PHP_INT_MAX
-                    : $allocatedRows + $this->config->maxRowsPerResult + 1;
+                $journalSlot = $this->decodeSlotBytes($slot);
                 $currentSlot = $this->readSlotLocked($schema, $rowId);
                 if (($journalSlot['status'] === self::SLOT_DELETED && ($rowId > $allocatedRows || $currentSlot === null))
                     || ($journalSlot['status'] === self::SLOT_ACTIVE && $rowId > $maximumAllowed)) {
@@ -1191,9 +1239,9 @@ final class Table
                     $this->validateJournalTarget($schema, $rowId, $journalSlot);
                     $rebuildIndexes = true;
                 }
-                if (!@unlink($this->journalPath())) {
-                    throw new FoxyException('Unable to clear row journal.', 'STORAGE_IO');
-                }
+            }
+            if (!@unlink($journalPath)) {
+                throw new FoxyException('Unable to clear row journal.', 'STORAGE_IO');
             }
         }
         if (is_file($this->dirtyPath()) || $rebuildIndexes || !$this->indexesComplete($schema)) {
@@ -1204,83 +1252,122 @@ final class Table
         }
     }
 
-    private function storeRowLocked(
-        array $schema,
-        int $rowId,
-        array $row,
-        ?array $oldRow,
-        ?string $preparedRecord = null,
-    ): void
+    private function commitRowsLocked(array $schema, array $changes): void
     {
-        $oldSlot = $this->readSlotLocked($schema, $rowId);
-        $generation = ($oldSlot['generation'] ?? 0) + 1;
-        $undoOldSlotBytes = $this->undoCallback !== null ? $this->readRawSlotBytesLocked($schema, $rowId) : null;
-        FileSystem::atomicWrite($this->dirtyPath(), "dirty\n", $this->config->syncWrites);
-        $record = $preparedRecord ?? $this->encodeRecord($schema, $rowId, $row);
-        $dataPath = $this->generationPath($schema) . DIRECTORY_SEPARATOR . 'rows.fdb';
-        $stream = @fopen($dataPath, 'c+b');
-        if ($stream === false) {
-            throw new FoxyException('Unable to open row data.', 'STORAGE_IO');
-        }
-        try {
-            if (fseek($stream, 0, SEEK_END) !== 0) {
-                throw new FoxyException('Unable to seek row data.', 'STORAGE_IO');
-            }
-            $offset = ftell($stream);
-            if ($offset === false) {
-                throw new FoxyException('Unable to determine row data offset.', 'STORAGE_IO');
-            }
-            FileSystem::writeAll($stream, $record);
-            FileSystem::flush($stream, $this->config->syncWrites);
-        } finally {
-            fclose($stream);
-        }
-        $slot = $this->encodeSlot($offset, strlen($record), $generation, self::SLOT_ACTIVE);
-        $this->commitSlotLocked($schema, $rowId, $slot);
-        try {
-            $this->applyIndexChangesLocked($schema, $rowId, $oldRow, $row);
-        } catch (\Throwable) {
-            $this->rebuildIndexesLocked($schema);
-        }
-        $this->finishMutationLocked();
-        if ($this->undoCallback !== null) {
-            ($this->undoCallback)($rowId, $undoOldSlotBytes, $oldRow, $row);
-        }
-    }
-
-    private function deleteRowLocked(array $schema, int $rowId, array $oldRow): void
-    {
-        $oldSlot = $this->readSlotLocked($schema, $rowId);
-        if ($oldSlot === null || $oldSlot['status'] !== self::SLOT_ACTIVE) {
+        if ($changes === []) {
             return;
         }
-        $undoOldSlotBytes = $this->undoCallback !== null ? $this->readRawSlotBytesLocked($schema, $rowId) : null;
-        FileSystem::atomicWrite($this->dirtyPath(), "dirty\n", $this->config->syncWrites);
-        $slot = $this->encodeSlot(0, 0, $oldSlot['generation'] + 1, self::SLOT_DELETED);
-        $this->commitSlotLocked($schema, $rowId, $slot);
-        try {
-            $this->applyIndexChangesLocked($schema, $rowId, $oldRow, null);
-        } catch (\Throwable) {
-            $this->rebuildIndexesLocked($schema);
-        }
-        $this->finishMutationLocked();
+        $undoEntries = [];
         if ($this->undoCallback !== null) {
-            ($this->undoCallback)($rowId, $undoOldSlotBytes, $oldRow, null);
+            foreach ($changes as $change) {
+                $undoEntries[] = [
+                    'row_id' => $change['row_id'],
+                    'old_slot' => $this->readRawSlotBytesLocked($schema, $change['row_id']),
+                    'old' => $change['old'],
+                    'new' => $change['new'],
+                ];
+            }
+        }
+        FileSystem::atomicWrite($this->dirtyPath(), "dirty\n", $this->config->syncWrites);
+        [$dataStream, $slotStream] = $this->generationStreams($schema);
+        $journalEntries = [];
+        $journalPart = 0;
+        $committedRows = 0;
+        $generation = (int) $schema['active_generation'];
+        try {
+            foreach ($changes as $change) {
+                $rowId = $change['row_id'];
+                $record = $change['record'] ?? null;
+                $offset = 0;
+                $length = 0;
+                if ($record !== null) {
+                    if (fseek($dataStream, 0, SEEK_END) !== 0) {
+                        throw new FoxyException('Unable to seek row data.', 'STORAGE_IO');
+                    }
+                    $offset = ftell($dataStream);
+                    if ($offset === false) {
+                        throw new FoxyException('Unable to determine row data offset.', 'STORAGE_IO');
+                    }
+                    FileSystem::writeAll($dataStream, $record);
+                    $length = strlen($record);
+                }
+                $currentSlot = $this->readSlotFromStream($slotStream, $rowId);
+                $slotGeneration = ($currentSlot['generation'] ?? 0) + 1;
+                $slot = $this->encodeSlot(
+                    $offset,
+                    $length,
+                    $slotGeneration,
+                    $record === null ? self::SLOT_DELETED : self::SLOT_ACTIVE,
+                );
+                $journalEntries[] = ['row_id' => $rowId, 'slot' => $slot];
+                $this->writeSlotToStream($slotStream, $rowId, $slot);
+                unset($this->slotCache[$generation . ':' . $rowId]);
+                if (count($journalEntries) >= self::JOURNAL_MAX_ENTRIES) {
+                    $this->sealJournalGroupLocked($schema, $journalEntries, $dataStream, $slotStream, $journalPart++);
+                    $committedRows += count($journalEntries);
+                    $journalEntries = [];
+                }
+            }
+            if ($journalEntries !== []) {
+                $this->sealJournalGroupLocked($schema, $journalEntries, $dataStream, $slotStream, $journalPart++);
+                $committedRows += count($journalEntries);
+                $journalEntries = [];
+            }
+            $store = $this->indexStore($schema);
+            foreach ($changes as $change) {
+                $oldEntries = $change['old'] === null ? [] : $this->indexEntries($schema, $change['old']);
+                $newEntries = $change['new'] === null ? [] : $this->indexEntries($schema, $change['new']);
+                foreach ($schema['indexes'] as $name => $index) {
+                    $old = $oldEntries[$name] ?? null;
+                    $new = $newEntries[$name] ?? null;
+                    if ($old !== null && !$old['skip']
+                        && ($new === null || $new['skip'] || $old['key'] !== $new['key'])) {
+                        $store->batchAppend($name, $old['key'], $change['row_id'], false);
+                    }
+                    if ($new !== null && !$new['skip']
+                        && ($old === null || $old['skip'] || $old['key'] !== $new['key'])) {
+                        $store->batchAppend($name, $new['key'], $change['row_id'], true);
+                    }
+                }
+            }
+            $this->flushIndexBatchLocked($store);
+            $this->notifyMutation();
+            $this->finishMutationLocked();
+        } catch (\Throwable $exception) {
+            $this->indexStore($schema)->discardBatch();
+            throw $exception;
+        } finally {
+            if ($this->undoCallback !== null) {
+                foreach (array_slice($undoEntries, 0, $committedRows) as $undo) {
+                    ($this->undoCallback)(
+                        $undo['row_id'],
+                        $undo['old_slot'],
+                        $undo['old'],
+                        $undo['new'],
+                    );
+                }
+            }
         }
     }
 
-    private function commitSlotLocked(array $schema, int $rowId, string $slot): void
-    {
-        FileSystem::writeMetadata($this->journalPath(), [
+    private function sealJournalGroupLocked(
+        array $schema,
+        array $entries,
+        $dataStream,
+        $slotStream,
+        int $part,
+    ): void {
+        FileSystem::flush($dataStream, $this->config->syncWrites);
+        FileSystem::writeMetadata($this->journalPath($part), [
             'generation' => $schema['active_generation'],
-            'row_id' => $rowId,
-            'slot' => $slot,
+            'entries' => $entries,
         ], $this->config->syncWrites);
-        $this->writeSlotLocked($schema, $rowId, $slot);
-        $this->notifyMutation();
-        if (!@unlink($this->journalPath())) {
-            throw new FoxyException('Unable to clear row journal.', 'STORAGE_IO');
-        }
+        FileSystem::flush($slotStream, $this->config->syncWrites);
+    }
+
+    private function flushIndexBatchLocked(IndexStore $store): void
+    {
+        $store->flushBatch();
     }
 
     private function finishMutationLocked(): void
@@ -1303,23 +1390,6 @@ final class Table
         $this->mutationNotified = true;
         if ($this->onMutation !== null) {
             ($this->onMutation)();
-        }
-    }
-
-    private function applyIndexChangesLocked(array $schema, int $rowId, ?array $oldRow, ?array $newRow): void
-    {
-        $store = $this->indexStore($schema);
-        $oldEntries = $oldRow === null ? [] : $this->indexEntries($schema, $oldRow);
-        $newEntries = $newRow === null ? [] : $this->indexEntries($schema, $newRow);
-        foreach ($schema['indexes'] as $name => $index) {
-            $old = $oldEntries[$name] ?? null;
-            $new = $newEntries[$name] ?? null;
-            if ($old !== null && !$old['skip'] && ($new === null || $new['skip'] || $old['key'] !== $new['key'])) {
-                $store->append($name, $old['key'], $rowId, false);
-            }
-            if ($new !== null && !$new['skip'] && ($old === null || $old['skip'] || $old['key'] !== $new['key'])) {
-                $store->append($name, $new['key'], $rowId, true);
-            }
         }
     }
 
@@ -1419,25 +1489,13 @@ final class Table
 
     private function iterateRowsLocked(array $schema, ?array $lookup, bool $includeRecord = false): \Generator
     {
-        $generation = $this->generationPath($schema);
-        $slotStream = @fopen($generation . DIRECTORY_SEPARATOR . 'rows.fdx', 'rb');
-        $dataStream = @fopen($generation . DIRECTORY_SEPARATOR . 'rows.fdb', 'rb');
-        if ($slotStream === false || $dataStream === false) {
-            if (is_resource($slotStream)) {
-                fclose($slotStream);
-            }
-            if (is_resource($dataStream)) {
-                fclose($dataStream);
-            }
-            throw new FoxyException('Unable to open table generation.', 'STORAGE_IO');
+        [$dataStream, $slotStream] = $this->generationStreams($schema);
+        $statistics = fstat($slotStream);
+        if ($statistics === false || ((int) $statistics['size']) % self::SLOT_BYTES !== 0) {
+            throw new FoxyException('Row slot file has a truncated tail.', 'STORAGE_CORRUPT');
         }
-        try {
-            $statistics = fstat($slotStream);
-            if ($statistics === false || ((int) $statistics['size']) % self::SLOT_BYTES !== 0) {
-                throw new FoxyException('Row slot file has a truncated tail.', 'STORAGE_CORRUPT');
-            }
-            $slotBytes = (int) $statistics['size'];
-            $lookupIndex = $lookup === null ? null : ($schema['indexes'][$lookup['name']] ?? null);
+        $slotBytes = (int) $statistics['size'];
+        $lookupIndex = $lookup === null ? null : ($schema['indexes'][$lookup['name']] ?? null);
             $lookupValid = $lookupIndex !== null
                 && ($lookup['signature'] ?? null) === [
                     'columns' => $lookupIndex['columns'],
@@ -1479,10 +1537,6 @@ final class Table
                     yield ['id' => $rowId] + $decoded + ['generation' => $slot['generation']];
                 }
             }
-        } finally {
-            fclose($slotStream);
-            fclose($dataStream);
-        }
     }
 
     private function encodeRecord(array $schema, int $rowId, array $row): string
@@ -1596,42 +1650,38 @@ final class Table
 
     private function readSlotLocked(array $schema, int $rowId): ?array
     {
-        $stream = @fopen($this->generationPath($schema) . DIRECTORY_SEPARATOR . 'rows.fdx', 'rb');
-        if ($stream === false) {
-            throw new FoxyException('Unable to open row slots.', 'STORAGE_IO');
+        $key = (int) $schema['active_generation'] . ':' . $rowId;
+        if (array_key_exists($key, $this->slotCache)) {
+            return $this->slotCache[$key];
         }
-        try {
-            return $this->readSlotFromStream($stream, $rowId);
-        } finally {
-            fclose($stream);
+        [$dataStream, $slotStream] = $this->generationStreams($schema);
+        $slot = $this->readSlotFromStream($slotStream, $rowId);
+        if ($slot !== null) {
+            if (count($this->slotCache) >= self::SLOT_CACHE_ENTRIES) {
+                array_shift($this->slotCache);
+            }
+            $this->slotCache[$key] = $slot;
         }
+        return $slot;
     }
 
     private function readRawSlotBytesLocked(array $schema, int $rowId): ?string
     {
-        $generation = $this->generationPath($schema);
-        $stream = @fopen($generation . DIRECTORY_SEPARATOR . 'rows.fdx', 'rb');
-        if ($stream === false) {
-            throw new FoxyException('Unable to open row slots.', 'STORAGE_IO');
+        [,$slotStream] = $this->generationStreams($schema);
+        $statistics = fstat($slotStream);
+        $streamBytes = (int) ($statistics['size'] ?? 0);
+        $offset = ($rowId - 1) * self::SLOT_BYTES;
+        if ($offset < 0 || $offset + self::SLOT_BYTES > $streamBytes) {
+            return null;
         }
-        try {
-            $statistics = fstat($stream);
-            $streamBytes = (int) ($statistics['size'] ?? 0);
-            $offset = ($rowId - 1) * self::SLOT_BYTES;
-            if ($offset < 0 || $offset + self::SLOT_BYTES > $streamBytes) {
-                return null;
-            }
-            if (fseek($stream, $offset) !== 0) {
-                throw new FoxyException('Unable to seek row slot.', 'STORAGE_IO');
-            }
-            $slot = FileSystem::readExact($stream, self::SLOT_BYTES) ?? '';
-            if ($slot === str_repeat("\0", self::SLOT_BYTES)) {
-                return null;
-            }
-            return $slot;
-        } finally {
-            fclose($stream);
+        if (fseek($slotStream, $offset) !== 0) {
+            throw new FoxyException('Unable to seek row slot.', 'STORAGE_IO');
         }
+        $slot = FileSystem::readExact($slotStream, self::SLOT_BYTES) ?? '';
+        if ($slot === str_repeat("\0", self::SLOT_BYTES)) {
+            return null;
+        }
+        return $slot;
     }
 
     private function readCurrentRows(array $rowIds): array
@@ -1650,44 +1700,28 @@ final class Table
         if ($rowIds === []) {
             return [];
         }
-        $generation = $this->generationPath($schema);
-        $slotStream = @fopen($generation . DIRECTORY_SEPARATOR . 'rows.fdx', 'rb');
-        $dataStream = @fopen($generation . DIRECTORY_SEPARATOR . 'rows.fdb', 'rb');
-        if ($slotStream === false || $dataStream === false) {
-            if (is_resource($slotStream)) {
-                fclose($slotStream);
-            }
-            if (is_resource($dataStream)) {
-                fclose($dataStream);
-            }
-            throw new FoxyException('Unable to open table generation.', 'STORAGE_IO');
-        }
+        [$dataStream, $slotStream] = $this->generationStreams($schema);
         $rows = [];
         $decodedBytes = 0;
-        try {
-            $statistics = fstat($slotStream);
-            if ($statistics === false || ((int) $statistics['size']) % self::SLOT_BYTES !== 0) {
-                throw new FoxyException('Row slot file has a truncated tail.', 'STORAGE_CORRUPT');
-            }
-            $slots = $this->readSlotsFromStream($slotStream, $rowIds, (int) $statistics['size']);
-            foreach ($rowIds as $rowId) {
-                $slot = $slots[$rowId] ?? null;
-                if ($slot === null || $slot['status'] !== self::SLOT_ACTIVE) {
-                    continue;
-                }
-                $decoded = $this->readRecord($dataStream, $schema, $rowId, $slot, false);
-                $decodedBytes += $decoded['_estimated_bytes'];
-                if ($decodedBytes > $this->config->maxMaterializedBytes) {
-                    throw new FoxyException('Row batch exceeded the configured materialization limit.', 'RESOURCE_LIMIT');
-                }
-                unset($decoded['_estimated_bytes']);
-                $rows[] = ['id' => $rowId] + $decoded + ['generation' => $slot['generation']];
-            }
-            return $rows;
-        } finally {
-            fclose($slotStream);
-            fclose($dataStream);
+        $statistics = fstat($slotStream);
+        if ($statistics === false || ((int) $statistics['size']) % self::SLOT_BYTES !== 0) {
+            throw new FoxyException('Row slot file has a truncated tail.', 'STORAGE_CORRUPT');
         }
+        $slots = $this->readSlotsFromStream($slotStream, $rowIds, (int) $statistics['size']);
+        foreach ($rowIds as $rowId) {
+            $slot = $slots[$rowId] ?? null;
+            if ($slot === null || $slot['status'] !== self::SLOT_ACTIVE) {
+                continue;
+            }
+            $decoded = $this->readRecord($dataStream, $schema, $rowId, $slot, false);
+            $decodedBytes += $decoded['_estimated_bytes'];
+            if ($decodedBytes > $this->config->maxMaterializedBytes) {
+                throw new FoxyException('Row batch exceeded the configured materialization limit.', 'RESOURCE_LIMIT');
+            }
+            unset($decoded['_estimated_bytes']);
+            $rows[] = ['id' => $rowId] + $decoded + ['generation' => $slot['generation']];
+        }
+        return $rows;
     }
 
     private function readSlotFromStream($stream, int $rowId, ?int $streamBytes = null): ?array
@@ -1772,6 +1806,7 @@ final class Table
         } finally {
             fclose($stream);
         }
+        unset($this->slotCache[(int) $schema['active_generation'] . ':' . $rowId]);
     }
 
     private function writeSlotToStream($stream, int $rowId, string $slot): void
@@ -1957,9 +1992,12 @@ final class Table
         return $this->path . DIRECTORY_SEPARATOR . 'sequence.fdb';
     }
 
-    private function journalPath(): string
+    private function journalPath(?int $part = null): string
     {
-        return $this->path . DIRECTORY_SEPARATOR . 'row.journal.fdb';
+        if ($part === null || $part === 0) {
+            return $this->path . DIRECTORY_SEPARATOR . 'row.journal.fdb';
+        }
+        return $this->path . sprintf(DIRECTORY_SEPARATOR . 'row.journal.%d.fdb', $part);
     }
 
     private function dirtyPath(): string
@@ -1970,6 +2008,51 @@ final class Table
     private function generationPath(array $schema): string
     {
         return $this->path . DIRECTORY_SEPARATOR . self::generationName((int) $schema['active_generation']);
+    }
+
+    private function generationStreams(array $schema): array
+    {
+        $generation = (int) $schema['active_generation'];
+        if ($this->streamsData !== null && $this->streamsGeneration === $generation) {
+            return [$this->streamsData, $this->streamsSlots];
+        }
+        $this->closeGenerationStreams();
+        $path = $this->generationPath($schema);
+        $data = @fopen($path . DIRECTORY_SEPARATOR . 'rows.fdb', 'c+b');
+        $slots = @fopen($path . DIRECTORY_SEPARATOR . 'rows.fdx', 'c+b');
+        if ($data === false || $slots === false) {
+            if (is_resource($data)) {
+                fclose($data);
+            }
+            if (is_resource($slots)) {
+                fclose($slots);
+            }
+            throw new FoxyException('Unable to open table generation.', 'STORAGE_IO');
+        }
+        $this->streamsData = $data;
+        $this->streamsSlots = $slots;
+        $this->streamsGeneration = $generation;
+        $this->slotCache = [];
+        return [$data, $slots];
+    }
+
+    public function closeGenerationStreams(): void
+    {
+        if (is_resource($this->streamsData)) {
+            fclose($this->streamsData);
+        }
+        if (is_resource($this->streamsSlots)) {
+            fclose($this->streamsSlots);
+        }
+        $this->streamsData = null;
+        $this->streamsSlots = null;
+        $this->streamsGeneration = null;
+        $this->slotCache = [];
+    }
+
+    public function __destruct()
+    {
+        $this->closeGenerationStreams();
     }
 
     private static function generationName(int $generation): string
@@ -2005,7 +2088,7 @@ final class Table
 
         $types = [
             'INT', 'VARCHAR', 'BIGINT', 'LONGTEXT', 'TEXT', 'BINARY', 'BLOB', 'TIMESTAMP',
-            'DATETIME', 'FLOAT', 'DOUBLE', 'BOOLEAN', 'REAL', 'TINYINT', 'UUID',
+            'DATETIME', 'FLOAT', 'DOUBLE', 'BOOLEAN', 'REAL', 'TINYINT', 'UUID', 'JSON',
         ];
         $columnNames = [];
         foreach ($metadata['columns'] as $column) {

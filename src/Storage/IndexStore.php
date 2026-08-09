@@ -19,6 +19,7 @@ final class IndexStore
     private const MAXIMUM_KEY_BYTES = 4_096;
     private const ORDERED_PAGE_SIZE = 256;
     private int $revision = 0;
+    private array $pendingWrites = [];
 
     public function __construct(
         private readonly string $root,
@@ -146,24 +147,51 @@ final class IndexStore
 
     public function append(string $indexName, string $key, int $rowId, bool $put): void
     {
+        $this->batchAppend($indexName, $key, $rowId, $put);
+        $this->flushBatch();
+    }
+
+    public function batchAppend(string $indexName, string $key, int $rowId, bool $put): void
+    {
         $path = $this->indexPath($indexName);
         if (!is_file($path)) {
             throw new FoxyException("Index {$indexName} is missing or incomplete.", 'STORAGE_CORRUPT');
         }
-        $operation = $put ? 'P' : 'D';
-        $body = $operation . BinaryCodec::uint64($rowId) . BinaryCodec::uint32(strlen($key));
-        $record = $body . BinaryCodec::uint32(BinaryCodec::crc32($body . $key)) . $key;
-        $stream = @fopen($path, 'ab');
-        if ($stream === false) {
-            throw new FoxyException('Unable to open index file.', 'STORAGE_IO');
+        $this->pendingWrites[$indexName][] = [$put ? 'P' : 'D', $rowId, $key];
+    }
+
+    public function flushBatch(): void
+    {
+        if ($this->pendingWrites === []) {
+            return;
         }
         try {
-            FileSystem::writeAll($stream, $record);
-            FileSystem::flush($stream, $this->config->syncWrites);
-            $this->revision++;
+            foreach ($this->pendingWrites as $indexName => $records) {
+                $path = $this->indexPath($indexName);
+                $stream = @fopen($path, 'ab');
+                if ($stream === false) {
+                    throw new FoxyException('Unable to open index file.', 'STORAGE_IO');
+                }
+                try {
+                    foreach ($records as [$operation, $rowId, $key]) {
+                        $body = $operation . BinaryCodec::uint64($rowId) . BinaryCodec::uint32(strlen($key));
+                        $record = $body . BinaryCodec::uint32(BinaryCodec::crc32($body . $key)) . $key;
+                        FileSystem::writeAll($stream, $record);
+                    }
+                    FileSystem::flush($stream, $this->config->syncWrites);
+                    $this->revision++;
+                } finally {
+                    fclose($stream);
+                }
+            }
         } finally {
-            fclose($stream);
+            $this->pendingWrites = [];
         }
+    }
+
+    public function discardBatch(): void
+    {
+        $this->pendingWrites = [];
     }
 
     public function lookup(string $indexName, string $key): array

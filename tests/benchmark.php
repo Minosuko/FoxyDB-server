@@ -91,6 +91,9 @@ try {
         'cache_statistics' => $storage->cacheStatistics(),
     ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), PHP_EOL;
 } finally {
+    if (isset($storage)) {
+        $storage->close();
+    }
     if (is_dir($directory)) {
         FileSystem::removeTree($directory);
     }

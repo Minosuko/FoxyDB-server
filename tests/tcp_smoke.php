@@ -104,6 +104,24 @@ try {
         throw new RuntimeException('TLS version policy was not enforced.');
     }
     $tls12Client->close();
+    $connectionPool = [];
+    for ($connection = 0; $connection < 24; $connection++) {
+        $connectionPool[] = Client::connect(
+            host: '127.0.0.1',
+            port: $port,
+            username: 'root',
+            password: 'root',
+            timeoutSeconds: 3.0,
+        );
+    }
+    foreach ($connectionPool as $pooledClient) {
+        if (!$pooledClient->ping()) {
+            throw new RuntimeException('A pooled client did not respond to ping.');
+        }
+    }
+    foreach ($connectionPool as $pooledClient) {
+        $pooledClient->close();
+    }
     $sessionDataPath = $directory . '/client-session.fdb';
     $sessionClient = Client::connect(
         host: '127.0.0.1',

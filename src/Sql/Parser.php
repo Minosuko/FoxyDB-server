@@ -10,7 +10,7 @@ use FoxyDB\Value\BinaryValue;
 
 final class Parser
 {
-    private const MAXIMUM_SQL_BYTES = 1_048_576;
+    private const MAXIMUM_SQL_BYTES = 16_777_216;
     private const STATEMENT_CACHE_BYTES = 4_194_304;
 
     private array $tokens = [];
@@ -31,7 +31,7 @@ final class Parser
     public function parse(string $sql): array
     {
         if (strlen($sql) > self::MAXIMUM_SQL_BYTES) {
-            throw new FoxyException('SQL text exceeds the 1 MiB limit.', 'SQL_TOO_LARGE');
+            throw new FoxyException('SQL text exceeds the 16 MiB limit.', 'SQL_TOO_LARGE');
         }
         $cacheKey = hash('sha256', $sql);
         $cached = $this->statementCache->get($cacheKey);
@@ -400,6 +400,24 @@ final class Parser
                     $this->expectSymbol(')');
                     $alias = $column !== null ? $func . '_' . $column : $func;
                     $projection = ['kind' => $func, 'column' => $column, 'alias' => $alias];
+                } elseif ($this->current()->type === 'IDENTIFIER'
+                    && strtoupper((string) $this->current()->value) === 'JSON_EXTRACT'
+                    && $this->isFunctionStart()) {
+                    $this->advance();
+                    $this->expectSymbol('(');
+                    $column = $this->qualifiedIdentifier();
+                    $this->expectSymbol(',');
+                    $path = $this->parseValueNode(false);
+                    if ($path['kind'] === 'literal' && !is_string($path['value'])) {
+                        throw $this->error('JSON_EXTRACT requires a string path.', $this->current());
+                    }
+                    $this->expectSymbol(')');
+                    $projection = [
+                        'kind' => 'json_extract',
+                        'column' => $column,
+                        'path' => $path,
+                        'alias' => $column,
+                    ];
                 } elseif ($this->current()->type === 'NUMBER' || $this->current()->type === 'STRING') {
                     $value = $this->parseValueNode(false);
                     $col = (string)($value['value'] ?? '?');
@@ -869,6 +887,25 @@ final class Parser
         }
         if ($this->canStartValue()) {
             return $this->parseValueNode(false);
+        }
+        if ($this->current()->type === 'IDENTIFIER'
+            && strtoupper((string) $this->current()->value) === 'JSON_EXTRACT'
+            && $this->peekSymbol('(', 1)) {
+            $this->advance();
+            $this->enterNesting();
+            try {
+                $this->expectSymbol('(');
+                $operand = $this->parseOperand();
+                $this->expectSymbol(',');
+                $path = $this->parseValueNode(false);
+                if ($path['kind'] === 'literal' && !is_string($path['value'])) {
+                    throw $this->error('JSON_EXTRACT requires a string path.', $this->current());
+                }
+                $this->expectSymbol(')');
+            } finally {
+                $this->nestingDepth--;
+            }
+            return ['kind' => 'call', 'name' => 'json_extract', 'operand' => $operand, 'path' => $path];
         }
         if ($this->current()->type === 'IDENTIFIER') {
             return ['kind' => 'column', 'name' => $this->qualifiedIdentifier()];

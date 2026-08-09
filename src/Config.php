@@ -32,6 +32,8 @@ final readonly class Config
         public ?string $logError = null,
         public bool $slowQueryLog = false,
         public ?string $slowQueryLogFile = null,
+        public int $maxConcurrentQueries = 32,
+        public int $maxQueuedQueriesPerClient = 8,
     ) {
         if ($port < 1 || $port > 65_535) {
             throw new FoxyException('Port must be between 1 and 65535.', 'INVALID_CONFIG');
@@ -46,6 +48,7 @@ final readonly class Config
         if ($maxMaterializedBytes < 1_048_576 || $maxMaterializedBytes > 4_294_967_296
             || $maxRowsPerResult < 1 || $idleTimeoutSeconds < 1 || $idleTimeoutSeconds > 31_536_000
             || $maxConnections < 1 || $maxTransfersPerClient < 1 || $maxGlobalTransfers < 1
+            || $maxConcurrentQueries < 1 || $maxQueuedQueriesPerClient < 1
             || $maxUploadBytes < 1 || $logMaxBytes < 1_024 || $logMaxFiles < 1 || $logMaxFiles > 100
             || $slowQueryMilliseconds < 0) {
             throw new FoxyException('Resource limits must be positive.', 'INVALID_CONFIG');
@@ -85,6 +88,8 @@ final readonly class Config
             logError: self::env('FOXYDB_LOG_ERROR') ?? $ini['log_error'] ?? null,
             slowQueryLog: self::envBool('FOXYDB_SLOW_QUERY_LOG', self::iniBool($ini['slow_query_log'] ?? null, false)),
             slowQueryLogFile: self::env('FOXYDB_SLOW_QUERY_LOG_FILE') ?? $ini['slow_query_log_file'] ?? null,
+            maxConcurrentQueries: self::envInt('FOXYDB_MAX_CONCURRENT_QUERIES', 32),
+            maxQueuedQueriesPerClient: self::envInt('FOXYDB_MAX_QUEUED_QUERIES', 8),
         );
     }
 
@@ -122,6 +127,8 @@ final readonly class Config
             slowQueryLogFile: array_key_exists('slowQueryLogFile', $overrides)
                 ? ($overrides['slowQueryLogFile'] === null ? null : (string) $overrides['slowQueryLogFile'])
                 : $this->slowQueryLogFile,
+            maxConcurrentQueries: (int) ($overrides['maxConcurrentQueries'] ?? $this->maxConcurrentQueries),
+            maxQueuedQueriesPerClient: (int) ($overrides['maxQueuedQueriesPerClient'] ?? $this->maxQueuedQueriesPerClient),
         );
     }
 
