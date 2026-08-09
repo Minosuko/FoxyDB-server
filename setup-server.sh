@@ -108,19 +108,31 @@ check_php() {
         PHP_BIN="$(command -v php || true)"
     fi
     [[ -n "$PHP_BIN" ]] || return 1
-    local ver size ok
+    local ver ok=0
     ver="$( "$PHP_BIN" -r 'echo PHP_VERSION_ID;' 2>/dev/null || echo 0 )"
-    size="$( "$PHP_BIN" -r 'echo PHP_INT_SIZE;' 2>/dev/null || echo 0 )"
-    [[ "$ver" -ge 70100 ]] || return 1
-    [[ "$size" == "8" ]] || return 1
-    ok=0
+    [[ "$ver" -ge 70100 ]] || return 2
     "$PHP_BIN" -r 'foreach (["json","mbstring","openssl","zlib"] as $e) { if (!extension_loaded($e)) { exit(1); } }' 2>/dev/null && ok=1
-    [[ "$ok" == "1" ]] || return 1
+    [[ "$ok" == "1" ]] || return 3
     return 0
 }
 
+warn_32bit() {
+    local size
+    size="$( "$PHP_BIN" -r 'echo PHP_INT_SIZE;' 2>/dev/null || echo 0 )"
+    if [[ "$size" != "8" ]]; then
+        warn "32-bit PHP detected (PHP_INT_SIZE=$size). The FoxyDB daemon expects 64-bit integers;" \
+            "the binary protocol and storage codecs may fail at runtime on this build."
+    fi
+}
+
 install_php() {
-    check_php && { log2 "Using existing PHP: $("$PHP_BIN" -v | head -n 1)"; return 0; }
+    local rc=0
+    check_php || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        log2 "Using existing PHP: $("$PHP_BIN" -v | head -n 1)"
+        warn_32bit
+        return 0
+    fi
     detect_package_manager
     log2 "Installing PHP and required extensions via $PM..."
     case "$PM" in
@@ -160,14 +172,18 @@ install_php() {
                 || true
             ;;
         *)
-            die "no supported package manager found; install PHP 7.1+ (64-bit) manually and re-run with --php=/path/to/php"
+            die "no supported package manager found; install PHP 7.1+ manually and re-run with --php=/path/to/php"
             ;;
     esac
-    if check_php; then
-        log2 "Using PHP: $("$PHP_BIN" -v | head -n 1)"
-    else
-        die "PHP 7.1+ (64-bit) with json, mbstring, openssl, zlib extensions is required. Install PHP and re-run $0 with --php=/path/to/php"
-    fi
+    check_php || rc=$?
+    case "$rc" in
+        0)  log2 "Using PHP: $("$PHP_BIN" -v | head -n 1)"
+            warn_32bit
+            ;;
+        2)  die "PHP $( "$PHP_BIN" -v 2>/dev/null | head -n 1 ) is too old; FoxyDB requires PHP 7.1 or newer. Install PHP and re-run $0 with --php=/path/to/php" ;;
+        3)  die "PHP is missing required extensions json, mbstring, openssl, zlib. Install them (e.g. php-mbstring) and re-run $0 with --php=/path/to/php" ;;
+        *)  die "PHP was not found after installation. Install PHP 7.1+ manually and re-run $0 with --php=/path/to/php" ;;
+    esac
 }
 
 create_user() {
