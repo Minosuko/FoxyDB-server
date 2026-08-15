@@ -228,6 +228,18 @@ try {
             throw new RuntimeException("Missing system table: {$tableName}");
         }
     }
+    $configCount = $client->query('SELECT COUNT(*) AS total FROM config_schema');
+    $configRows = $client->query(
+        'SELECT * FROM config_schema ORDER BY config_key ASC LIMIT ? OFFSET ?',
+        [50, 0],
+    );
+    if (($configCount->rows[0]['total'] ?? 0) < count($configRows->rows)) {
+        throw new RuntimeException('Browsing config_schema returned inconsistent rows.');
+    }
+    $configValues = array_column($configRows->rows, 'config_value', 'config_key');
+    if (($configValues['default_host'] ?? null) !== '127.0.0.1') {
+        throw new RuntimeException('config_schema did not expose the configured default host.');
+    }
     $rootUser = $client->query("SELECT username, password_hash FROM users_schema WHERE username = 'root'");
     $rootRows = iterator_to_array($rootUser->rows, false);
     if (count($rootRows) !== 1 || $rootRows[0]['password_hash'] === 'root'

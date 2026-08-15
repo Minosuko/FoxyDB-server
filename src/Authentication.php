@@ -234,6 +234,10 @@ final class Authentication
             'config_key' => 'server_version',
             'config_value' => '1',
         ]);
+        $this->seedRow('config_schema', ['config_key' => 'default_host'], [
+            'config_key' => 'default_host',
+            'config_value' => $this->config->host,
+        ]);
         $this->seedRow('config_schema', ['config_key' => 'default_port'], [
             'config_key' => 'default_port',
             'config_value' => (string) $this->config->port,

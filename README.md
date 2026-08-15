@@ -9,7 +9,7 @@ For SQLite-style deployment without a daemon or network connection, use the [`Mi
 ## Features
 
 - TCP server on `127.0.0.1:2002` by default
-- TLS 1.2 and TLS 1.3 encryption on every network connection
+- TLS 1.2 and TLS 1.3 by default, with an explicit plaintext-only mode for trusted networks
 - Cooperative query scheduling: while one connection streams a large result, other connections are authenticated and served concurrently
 - SQL lexer, parser, typed AST, and execution engine (statements up to 16 MiB and 1,000,000 tokens)
 - `INT`, `VARCHAR`, `BIGINT`, `LONGTEXT`, `TEXT`, `BINARY`, `BLOB`, `TIMESTAMP`, `DATETIME`, `FLOAT`, `DOUBLE`, `BOOLEAN`, `REAL`, `TINYINT`, `UUID`, and `JSON`
@@ -30,7 +30,7 @@ For SQLite-style deployment without a daemon or network connection, use the [`Mi
 ## Requirements
 
 - 32-bit or 64-bit PHP 8.2 or newer
-- `json`, `mbstring`, `openssl`, and `zlib` PHP extensions
+- `json`, `mbstring`, and `zlib` PHP extensions; `openssl` is required unless plaintext mode is enabled
 - Permission to create and update the configured data directory
 
 ## Start
@@ -41,13 +41,16 @@ From the `server` directory:
 php bin/foxydb.php
 ```
 
-The default endpoint is `tls://127.0.0.1:2002` and the default data directory is `server/data`. Plaintext network sessions are rejected.
+The default endpoint is `tls://127.0.0.1:2002` and the default data directory is `server/data`. Plaintext network sessions are rejected unless the server is explicitly started in plaintext-only mode:
 
 Command-line options:
 
 ```console
 php bin/foxydb.php --host=127.0.0.1 --port=2002 --data-dir=./data
+php bin/foxydb.php --host=127.0.0.1 --port=2002 --data-dir=./data --plaintext
 ```
+
+`--plaintext` is equivalent to `FOXYDB_TLS=false`. It disables TLS for the endpoint rather than accepting TLS and plaintext on the same port. Use it only on loopback, a trusted private network, or behind a secure tunnel because credentials and database traffic are transmitted without encryption.
 
 The daemon does not accept usernames or passwords through command-line options or environment variables. On first initialization, if `foxydb.users_schema` is empty, FoxyDB creates `root` with password `root`. Change that password through the authenticated database connection after startup.
 
@@ -109,7 +112,7 @@ $db = Client::connect(
 );
 ```
 
-TLS modes are `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, and `VERIFY_IDENTITY`. The daemon itself is TLS-only, so `DISABLED` cannot connect. `PREFERRED` is provided for client compatibility with other endpoints and should not be used for administration.
+TLS modes are `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, and `VERIFY_IDENTITY`. Use `DISABLED` for a server started with `--plaintext`; `PREFERRED` tries TLS first and then falls back to plaintext. `REQUIRED` remains the default and fails closed against plaintext endpoints.
 
 ## System Database
 
@@ -117,7 +120,7 @@ The server automatically creates and selects the `foxydb` database after login. 
 
 - `users_schema`: usernames, immutable server-generated account UUIDs, password hashes, account state, and timestamps
 - `privileges`: per-account database, table, and privilege grants
-- `config_schema`: persistent server configuration records
+- `config_schema`: persistent server configuration records, including `default_host` and `default_port`
 - `performance_schema`: performance and lifecycle metrics
 - `sys_config`: runtime storage settings and descriptions
 
@@ -435,9 +438,10 @@ Table and catalog locks are stored separately from removable table directories. 
 
 | Environment variable | Default | Purpose |
 | --- | ---: | --- |
-| `FOXYDB_HOST` | `127.0.0.1` | TLS TCP bind host |
+| `FOXYDB_HOST` | `127.0.0.1` | TCP bind host |
 | `FOXYDB_PORT` | `2002` | TCP port |
 | `FOXYDB_DATA_DIR` | `server/data` | Persistent data directory |
+| `FOXYDB_TLS` | `true` | Enable TLS; `false` starts a plaintext-only endpoint |
 | `FOXYDB_MAX_FRAME_BYTES` | `8388608` | Initial connection frame limit; `max_allowed_packet` may raise it to the protocol maximum |
 | `FOXYDB_CHUNK_BYTES` | `1048576` | Stored and transferred chunk size |
 | `FOXYDB_INLINE_VALUE_BYTES` | `65536` | Large-value chunking threshold |

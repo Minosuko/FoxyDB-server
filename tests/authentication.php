@@ -24,6 +24,13 @@ try {
             throw new RuntimeException("Missing bootstrapped table: {$table}");
         }
     }
+    $configuration = [];
+    foreach ($storage->table(Authentication::SYSTEM_DATABASE, 'config_schema')->rows() as $entry) {
+        $configuration[$entry['values']['config_key']] = $entry['values']['config_value'];
+    }
+    if (($configuration['default_host'] ?? null) !== '127.0.0.1') {
+        throw new RuntimeException('The default host was not seeded in config_schema.');
+    }
     if ($authentication->authenticate('root', 'root') !== 'root'
         || !$authentication->hasPrivilege('root', 'SELECT', 'anything', 'anything')) {
         throw new RuntimeException('Default root login or privilege is missing.');

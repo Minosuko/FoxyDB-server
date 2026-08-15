@@ -14,6 +14,7 @@ $tests = [
     'system_variables.php',
     'logging.php',
     'secure_options.php',
+    'plaintext_smoke.php',
     'tcp_smoke.php',
     'concurrency_smoke.php',
     'replication.php',

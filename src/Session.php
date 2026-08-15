@@ -581,9 +581,15 @@ $groupColumns = $statement['group'] ?? [];
         }
 
         $resultColumns = array_column($projections, 'alias');
-        $hasAggregate = !$hasGroup && array_any($projections, static fn(array $p): bool =>
-            in_array($p['kind'], ['count', 'sum', 'avg', 'min', 'max'], true)
-        );
+        $hasAggregate = false;
+        if (!$hasGroup) {
+            foreach ($projections as $projection) {
+                if (in_array($projection['kind'], ['count', 'sum', 'avg', 'min', 'max'], true)) {
+                    $hasAggregate = true;
+                    break;
+                }
+            }
+        }
         if ($hasGroup || $hasAggregate) {
             $rowsIter = (function () use ($table, $lookup, $predicate): \Generator {
                 foreach ($table->rows($lookup) as $entry) {
