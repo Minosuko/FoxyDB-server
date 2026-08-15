@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace FoxyDB\Sql;
 
 use FoxyDB\Exception\FoxyException;
+use FoxyDB\Support\Identifiers;
 use FoxyDB\Support\MemoryCache;
 use FoxyDB\Value\BinaryValue;
 
@@ -130,6 +131,7 @@ final class Parser
             'table' => $table,
             'columns' => $this->parseColumnList(),
             'unique' => $unique,
+            'ordered' => $this->matchKeyword('ORDERED'),
             'if_not_exists' => $ifNotExists,
         ];
     }
@@ -270,7 +272,12 @@ final class Parser
             if (!$this->peekSymbol('(')) {
                 $name = $this->identifier();
             }
-            return ['kind' => 'index', 'name' => $name, 'columns' => $this->parseColumnList()];
+            return [
+                'kind' => 'index',
+                'name' => $name,
+                'columns' => $this->parseColumnList(),
+                'ordered' => $this->matchKeyword('ORDERED'),
+            ];
         }
         throw $this->error('Invalid table constraint.');
     }
@@ -451,15 +458,21 @@ final class Parser
             $joins[] = ['table' => $table, 'alias' => $alias];
         } while ($this->matchSymbol(','));
 
-        $left = false;
-        $right = false;
-        while (($this->matchKeyword('INNER') || $this->matchKeyword('CROSS'))
-            || ($left = $this->matchKeyword('LEFT'))
-            || ($right = $this->matchKeyword('RIGHT'))) {
+        while (true) {
+            $left = $this->matchKeyword('LEFT');
+            $right = !$left && $this->matchKeyword('RIGHT');
+            $cross = !$left && !$right && $this->matchKeyword('CROSS');
+            $inner = !$left && !$right && !$cross && $this->matchKeyword('INNER');
+            $bare = !$left && !$right && !$cross && !$inner && $this->matchKeyword('JOIN');
+            if (!$left && !$right && !$cross && !$inner && !$bare) {
+                break;
+            }
             if ($left || $right) {
                 $this->matchKeyword('OUTER');
             }
-            $this->expectKeyword('JOIN');
+            if (!$bare) {
+                $this->expectKeyword('JOIN');
+            }
             $table = $this->qualifiedIdentifier();
             $alias = null;
             if ($this->matchKeyword('AS')) {
@@ -471,10 +484,13 @@ final class Parser
                 ], true)) {
                 $alias = $this->identifier();
             }
-            $this->expectKeyword('ON');
-            $on = $this->parseExpression();
-            $joinType = $right ? 'right' : ($left ? 'left' : 'inner');
-            $joins[] = ['table' => $table, 'alias' => $alias, 'join' => $joinType, 'on' => $on];
+            $joinType = $right ? 'right' : ($left ? 'left' : ($cross ? 'cross' : 'inner'));
+            $join = ['table' => $table, 'alias' => $alias, 'join' => $joinType];
+            if (!$cross) {
+                $this->expectKeyword('ON');
+                $join['on'] = $this->parseExpression();
+            }
+            $joins[] = $join;
         }
         $where = $this->matchKeyword('WHERE') ? $this->parseExpression() : null;
         $group = [];
@@ -591,15 +607,25 @@ final class Parser
                     $actions[] = ['kind' => 'add_constraint', 'constraint' => $constraint];
                 } elseif ($this->matchKeyword('INDEX') || $this->matchKeyword('KEY')) {
                     $name = $this->identifier();
-                    $this->expectSymbol('(');
                     $columns = $this->parseColumnList();
-                    $actions[] = ['kind' => 'add_index', 'name' => $name, 'columns' => $columns, 'unique' => false];
+                    $actions[] = [
+                        'kind' => 'add_index',
+                        'name' => $name,
+                        'columns' => $columns,
+                        'ordered' => $this->matchKeyword('ORDERED'),
+                        'unique' => false,
+                    ];
                 } elseif ($this->matchKeyword('UNIQUE')) {
                     $this->matchKeyword('INDEX') || $this->matchKeyword('KEY');
                     $name = $this->identifier();
-                    $this->expectSymbol('(');
                     $columns = $this->parseColumnList();
-                    $actions[] = ['kind' => 'add_index', 'name' => $name, 'columns' => $columns, 'unique' => true];
+                    $actions[] = [
+                        'kind' => 'add_index',
+                        'name' => $name,
+                        'columns' => $columns,
+                        'ordered' => $this->matchKeyword('ORDERED'),
+                        'unique' => true,
+                    ];
                 } elseif ($this->matchKeyword('PRIMARY')) {
                     $this->expectKeyword('KEY');
                     $this->expectSymbol('(');
@@ -950,9 +976,7 @@ final class Parser
         }
         if ($token->type === 'PARAMETER') {
             $this->advance();
-            if (++$this->parameterTotal > 65_535) {
-                throw $this->error('SQL statement contains too many parameters.', $token);
-            }
+            $this->parameterTotal++;
             $key = $token->value ?? $this->parameterIndex++;
             return ['kind' => 'parameter', 'key' => $key];
         }
@@ -1060,7 +1084,7 @@ final class Parser
             throw $this->error('Expected an identifier.');
         }
         $this->advance();
-        return strtolower((string) $token->value);
+        return Identifiers::normalize((string) $token->value);
     }
 
     private function qualifiedIdentifier(): string
@@ -1181,18 +1205,7 @@ final class Parser
         if ($isPrivilege) {
             $privilege = strtoupper($this->identifier());
             $this->expectKeyword('ON');
-            $database = $this->identifier();
-            $table = '*';
-            if ($this->matchSymbol('.')) {
-                if ($this->peekSymbol('*')) {
-                    $this->matchSymbol('*');
-                } else {
-                    $table = $this->identifier();
-                }
-            } else {
-                $table = $database;
-                $database = '*';
-            }
+            [$database, $table] = $this->parseGrantObject();
             $this->expectKeyword('TO');
             $grantee = $this->identifier();
             return [
@@ -1226,18 +1239,7 @@ final class Parser
         if ($isPrivilege) {
             $privilege = strtoupper($this->identifier());
             $this->expectKeyword('ON');
-            $database = $this->identifier();
-            $table = '*';
-            if ($this->matchSymbol('.')) {
-                if ($this->peekSymbol('*')) {
-                    $this->matchSymbol('*');
-                } else {
-                    $table = $this->identifier();
-                }
-            } else {
-                $table = $database;
-                $database = '*';
-            }
+            [$database, $table] = $this->parseGrantObject();
             $this->expectKeyword('FROM');
             $grantee = $this->identifier();
             return [
@@ -1270,6 +1272,10 @@ final class Parser
         if (!in_array($operation, ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'ALL'], true)) {
             throw $this->error("Expected SELECT, INSERT, UPDATE, DELETE, or ALL after FOR.");
         }
+        $scope = null;
+        if ($this->matchKeyword('TO')) {
+            $scope = $this->identifier();
+        }
         $this->expectKeyword('USING');
         $this->expectSymbol('(');
         $expression = $this->parseExpression();
@@ -1280,6 +1286,7 @@ final class Parser
             'table' => $table,
             'operation' => $operation,
             'expression' => $expression,
+            'scope' => $scope,
         ];
     }
 
@@ -1302,6 +1309,47 @@ final class Parser
         $this->matchKeyword('WORK');
         $this->matchKeyword('TRANSACTION');
         return ['type' => 'begin'];
+    }
+
+    /**
+     * Reads the object of GRANT or REVOKE as a (database, table) pair.
+     *
+     * The table position accepts '*' or '%' for "every table"; a bare name
+     * without a dot targets that name in any database. A trailing '%' on a
+     * name turns it into an anchored prefix pattern, so grants like
+     * {@code GRANT SELECT ON sales%.orders TO u} cover every matching name.
+     *
+     * @return array{string, string}
+     */
+    private function parseGrantObject(): array
+    {
+        $database = $this->parseGrantName();
+        $table = '*';
+        if ($this->matchSymbol('.')) {
+            $table = $this->parseGrantName();
+        } else {
+            $table = $database;
+            $database = '*';
+        }
+        return [$database, $table];
+    }
+
+    private function parseGrantName(): string
+    {
+        if ($this->peekSymbol('*')) {
+            $this->advance();
+            return '*';
+        }
+        if ($this->peekSymbol('%')) {
+            $this->advance();
+            return '%';
+        }
+        $name = $this->identifier();
+        if ($this->peekSymbol('%')) {
+            $this->advance();
+            return $name . '%';
+        }
+        return $name;
     }
 
     private function parseEndKeyword(string $type): array

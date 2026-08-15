@@ -120,8 +120,8 @@ warn_32bit() {
     local size
     size="$( "$PHP_BIN" -r 'echo PHP_INT_SIZE;' 2>/dev/null || echo 0 )"
     if [[ "$size" != "8" ]]; then
-        warn "32-bit PHP detected (PHP_INT_SIZE=$size). The FoxyDB daemon expects 64-bit integers;" \
-            "the binary protocol and storage codecs may fail at runtime on this build."
+        warn "32-bit PHP detected (PHP_INT_SIZE=$size). FoxyDB will use constrained mode;" \
+            "BIGINT values, ids, byte limits, and individual file offsets are limited to PHP_INT_MAX."
     fi
 }
 

@@ -9,6 +9,7 @@ use FoxyDB\Exception\FoxyException;
 use FoxyDB\Sql\Parser;
 use FoxyDB\Storage\StorageEngine;
 use FoxyDB\Storage\Table;
+use FoxyDB\Storage\IndexStore;
 use FoxyDB\Support\MemoryCache;
 use FoxyDB\Value\BinaryValue;
 
@@ -22,6 +23,8 @@ final class Session
     private array $sessionVariables = [];
     private bool $inTransaction = false;
     private array $txnUndo = [];
+    private array $pendingJournal = [];
+    private ?array $sessionRoleNames = null;
 
     public function __construct(
         private readonly StorageEngine $storage,
@@ -50,9 +53,58 @@ final class Session
         $this->currentDatabase = Authentication::SYSTEM_DATABASE;
     }
 
+    /**
+     * Record a replicated change. When inside a transaction the change is
+     * buffered and only written to the journal on COMMIT; ROLLBACK discards
+     * it so the replica never sees partial work.
+     */
+    private function journalChange(string $database, string $table, string $changeType, string $changeSql): void
+    {
+        if (!$this->config->replicationEnabled) {
+            return;
+        }
+        if (!Replication::applicable($database, $table)) {
+            return;
+        }
+        $entry = [
+            'database' => $database,
+            'table' => $table,
+            'change_type' => $changeType,
+            'change_sql' => $changeSql,
+        ];
+        if ($this->inTransaction) {
+            $this->pendingJournal[] = $entry;
+            return;
+        }
+        Replication::append($this->storage, $database, $table, $changeType, $changeSql);
+    }
+
+    private function flushPendingJournal(): void
+    {
+        if ($this->pendingJournal === []) {
+            return;
+        }
+        $entries = $this->pendingJournal;
+        $this->pendingJournal = [];
+        foreach ($entries as $entry) {
+            Replication::append(
+                $this->storage,
+                $entry['database'],
+                $entry['table'],
+                $entry['change_type'],
+                $entry['change_sql'],
+            );
+        }
+    }
+
     public function execute(string $sql, array $parameters = []): ExecutionResult
     {
         $statement = $this->parser->parse($sql);
+        if ($this->inTransaction && !in_array($statement['type'], [
+            'select', 'insert', 'update', 'delete', 'commit', 'rollback', 'begin',
+        ], true)) {
+            throw new FoxyException('DDL and administration are not allowed inside a transaction.', 'TRANSACTION_DDL');
+        }
         $this->authorize($statement);
         for ($index = 0; $index < $statement['parameter_count']; $index++) {
             if (!array_key_exists($index, $parameters)) {
@@ -65,7 +117,10 @@ final class Session
             return $result;
         }
 
-        $cacheKey = $statement['type'] === 'select' ? $this->queryCacheKey($statement, $sql, $parameters) : null;
+        $cacheKey = null;
+        if ($statement['type'] === 'select') {
+            $cacheKey = $this->queryCacheKey($statement, $sql, $parameters);
+        }
         if ($cacheKey !== null) {
             $cached = $this->storage->queryCacheGet($cacheKey);
             if (is_array($cached)) {
@@ -120,15 +175,28 @@ final class Session
     private function createDatabase(array $statement): ExecutionResult
     {
         $this->storage->createDatabase($statement['database'], $statement['if_not_exists']);
+        $this->journalChange(
+            $statement['database'],
+            '',
+            'CREATE_DATABASE',
+            Replication::createDatabaseSql($statement['database']),
+        );
         return ExecutionResult::command(metadata: ['database' => $statement['database']]);
     }
 
     private function dropDatabase(array $statement): ExecutionResult
     {
         $this->storage->dropDatabase($statement['database'], $statement['if_exists']);
+        $this->deletePoliciesFor($statement['database']);
         if ($this->currentDatabase === $statement['database']) {
             $this->currentDatabase = null;
         }
+        $this->journalChange(
+            $statement['database'],
+            '',
+            'DROP_DATABASE',
+            Replication::dropDatabaseSql($statement['database']),
+        );
         return ExecutionResult::command();
     }
 
@@ -214,15 +282,35 @@ final class Session
             $schema,
             $statement['if_not_exists'],
         );
+        $this->journalChange(
+            $database,
+            '',
+            'USE',
+            Replication::useSql($database),
+        );
+        $this->journalChange(
+            $database,
+            $statement['table'],
+            'CREATE_TABLE',
+            Replication::createTableSql($database, $statement['table'], $schema),
+        );
         return ExecutionResult::command(metadata: ['table' => $statement['table']]);
     }
 
     private function dropTable(array $statement): ExecutionResult
     {
+        [$database, $table] = $this->tableTarget($statement['table']);
         $this->storage->dropTable(
-            $this->requireDatabase(),
-            $statement['table'],
+            $database,
+            $table,
             $statement['if_exists'],
+        );
+        $this->deletePoliciesFor($database, $table);
+        $this->journalChange(
+            $database,
+            $table,
+            'DROP_TABLE',
+            Replication::dropTableSql($database, $table),
         );
         return ExecutionResult::command();
     }
@@ -282,10 +370,11 @@ final class Session
                     'sequence' => $sequence + 1,
                     'unique' => $index['unique'],
                     'primary' => $index['primary'],
+                    'ordered' => (bool) ($index['ordered'] ?? false),
                 ];
             }
         }
-        return ExecutionResult::rows(['index', 'column', 'sequence', 'unique', 'primary'], $rows);
+        return ExecutionResult::rows(['index', 'column', 'sequence', 'unique', 'primary', 'ordered'], $rows);
     }
 
     private function createIndex(array $statement): ExecutionResult
@@ -295,6 +384,19 @@ final class Session
             $statement['columns'],
             $statement['unique'],
             $statement['if_not_exists'],
+            $statement['ordered'] ?? false,
+        );
+        $this->journalChange(
+            $this->requireDatabase(),
+            '',
+            'USE',
+            Replication::useSql($this->requireDatabase()),
+        );
+        $this->journalChange(
+            $this->requireDatabase(),
+            $statement['table'],
+            'CREATE_INDEX',
+            Replication::createIndexSql($this->requireDatabase(), $statement['table'], $statement),
         );
         return ExecutionResult::command();
     }
@@ -302,6 +404,12 @@ final class Session
     private function dropIndex(array $statement): ExecutionResult
     {
         $this->table($statement['table'])->dropIndex($statement['name'], $statement['if_exists']);
+        $this->journalChange(
+            $this->requireDatabase(),
+            $statement['table'],
+            'DROP_INDEX',
+            Replication::dropIndexSql($this->requireDatabase(), $statement['table'], $statement),
+        );
         return ExecutionResult::command();
     }
 
@@ -327,10 +435,10 @@ final class Session
                 throw new FoxyException('INSERT column and value counts do not match.', 'SQL_SEMANTIC');
             }
         }
-
         $inputs = [];
         $inputBytes = 0;
         $memoryLimit = $this->mutationMemoryLimit();
+        $rowCheck = $this->writePolicyCheck('INSERT', $statement, $schema);
         foreach ($statement['rows'] as $nodes) {
             $input = [];
             foreach ($nodes as $position => $node) {
@@ -361,7 +469,7 @@ final class Session
             });
         }
         try {
-            $insertedRows = $table->insertMany($inputs, max(0, $memoryLimit - $inputBytes));
+            $insertedRows = $table->insertMany($inputs, max(0, $memoryLimit - $inputBytes), $rowCheck);
         } finally {
             if ($this->inTransaction) {
                 $table->setUndoCallback(null);
@@ -370,6 +478,16 @@ final class Session
         $lastInsertId = null;
         foreach ($insertedRows as $inserted) {
             $lastInsertId = $inserted['last_insert_id'] ?? $lastInsertId;
+        }
+        if ($this->config->replicationEnabled && Replication::applicable($this->requireDatabase(), $statement['table'])) {
+            $rows = array_map(static fn(array $inserted): array => $inserted['row'], $insertedRows);
+            $rowColumns = array_column($schema['columns'], 'name');
+            $this->journalChange(
+                $this->requireDatabase(),
+                $statement['table'],
+                'INSERT',
+                Replication::insertSql($this->requireDatabase(), $statement['table'], $rowColumns, $rows),
+            );
         }
         return ExecutionResult::command(count($insertedRows), $lastInsertId);
     }
@@ -519,9 +637,6 @@ $groupColumns = $statement['group'] ?? [];
                 if ($sortBytes > $sortLimit) {
                     throw new FoxyException('ORDER BY exceeded the configured sort memory limit.', 'RESOURCE_LIMIT');
                 }
-                if (count($matching) > $this->config->maxRowsPerResult) {
-                    throw new FoxyException('ORDER BY exceeded the configured in-memory row limit.', 'RESOURCE_LIMIT');
-                }
             }
             $orders = $statement['order'];
             usort($matching, function (array $left, array $right) use ($orders): int {
@@ -544,8 +659,7 @@ $groupColumns = $statement['group'] ?? [];
             return ExecutionResult::rows($resultColumns, $rows);
         }
 
-        $maximumRows = $this->config->maxRowsPerResult;
-        $rows = (function () use ($table, $lookup, $predicate, $offset, $limit, $projections, $maximumRows): \Generator {
+        $rows = (function () use ($table, $lookup, $predicate, $offset, $limit, $projections): \Generator {
             $skipped = 0;
             $produced = 0;
             foreach ($table->rows($lookup) as $entry) {
@@ -560,9 +674,6 @@ $groupColumns = $statement['group'] ?? [];
                 if ($limit !== null && $produced >= $limit) {
                     break;
                 }
-                if ($produced >= $maximumRows) {
-                    throw new FoxyException('Result exceeded the configured row limit.', 'RESOURCE_LIMIT');
-                }
                 $produced++;
                 yield $this->project($row, $projections);
             }
@@ -576,6 +687,7 @@ $groupColumns = $statement['group'] ?? [];
         $schemas = [];
         $columnMaps = [];
         $aliases = [];
+        $policyPredicates = [];
         foreach ($from as $i => $entry) {
             $table = $this->table($entry['table']);
             $schema = $table->schema();
@@ -583,11 +695,23 @@ $groupColumns = $statement['group'] ?? [];
             $schemas[] = $schema;
             $columnMaps[] = $this->columnMap($schema);
             $aliases[$i] = $entry['alias'] ?? $this->tableName($entry['table']);
+            if (count(array_keys($aliases, $aliases[$i], true)) > 1) {
+                throw new FoxyException("Duplicate table alias: {$aliases[$i]}", 'SQL_SEMANTIC');
+            }
+            [$database, $tableName] = $this->tableTarget($entry['table']);
+            $policy = $this->applicablePolicyExpression('SELECT', $database, $tableName);
+            $policyPredicates[$i] = $policy === null
+                ? null
+                : $this->predicate($policy, $this->columnMap($schema), []);
+        }
+        $bareCounts = [];
+        foreach ($columnMaps as $map) {
+            foreach (array_keys($map) as $name) {
+                $bareCounts[$name] = ($bareCounts[$name] ?? 0) + 1;
+            }
         }
         $limit = $this->nonNegativeInteger($statement['limit'], $parameters, 'LIMIT');
         $offset = $this->nonNegativeInteger($statement['offset'], $parameters, 'OFFSET') ?? 0;
-        $maximumRows = $this->config->maxRowsPerResult;
-
         $projections = $statement['projections'];
         if ($projections[0]['kind'] === 'all') {
             $projections = [];
@@ -606,6 +730,11 @@ $groupColumns = $statement['group'] ?? [];
         $countProjection = false;
         $projAliasesCheck = [];
         foreach ($projections as &$projection) {
+            $projectionColumn = $projection['column'] ?? null;
+            if (is_string($projectionColumn) && !str_contains($projectionColumn, '.')
+                && ($bareCounts[$projectionColumn] ?? 0) > 1) {
+                throw new FoxyException("Column {$projectionColumn} is ambiguous.", 'AMBIGUOUS_COLUMN');
+            }
             if ($projection['kind'] === 'count') {
                 $countProjection = true;
             } elseif ($projection['kind'] === 'json_extract') {
@@ -668,7 +797,11 @@ $groupColumns = $statement['group'] ?? [];
                 $onPredicates[$i] = $this->joinPredicate($entry['on'], $columnMaps, $aliases, $parameters);
             }
         }
-
+        foreach ($statement['order'] as $order) {
+            if (($bareCounts[$order['column']] ?? 0) > 1) {
+                throw new FoxyException("Column {$order['column']} is ambiguous.", 'AMBIGUOUS_COLUMN');
+            }
+        }
         $wherePredicate = $this->joinPredicate($statement['where'] ?? null, $columnMaps, $aliases, $parameters);
 
         if ($hasGroup) {
@@ -677,11 +810,19 @@ $groupColumns = $statement['group'] ?? [];
                 $prefix = $aliases[$i];
                 foreach ($map as $name => $col) {
                     $mergedColumns[$prefix . '.' . $name] = $col;
-                    $mergedColumns[$name] = $col;
+                    if (($bareCounts[$name] ?? 0) === 1) {
+                        $mergedColumns[$name] = $col;
+                    }
                 }
             }
-            $rowsIter = (function () use ($tables, $schemas, $columnMaps, $onPredicates, $joinTypes, $wherePredicate): \Generator {
-                foreach ($this->joinIterator($tables, $schemas, $columnMaps, $onPredicates, $joinTypes, null, null) as $row) {
+            $rowsIter = (function () use (
+                    $tables, $schemas, $columnMaps, $onPredicates, $joinTypes,
+                    $wherePredicate, $policyPredicates, $aliases,
+                ): \Generator {
+                    foreach ($this->joinIterator(
+                    $tables, $schemas, $columnMaps, $onPredicates, $joinTypes,
+                    null, null, $policyPredicates, $aliases,
+                ) as $row) {
                     if ($wherePredicate === null || $wherePredicate($row)) {
                         yield $row;
                     }
@@ -702,7 +843,10 @@ $groupColumns = $statement['group'] ?? [];
                 (int) $this->systemValue('tmp_table_size', 67_108_864),
             );
             $matching = [];
-            $iter = $this->joinIterator($tables, $schemas, $columnMaps, $onPredicates, $joinTypes, null, null);
+            $iter = $this->joinIterator(
+                $tables, $schemas, $columnMaps, $onPredicates, $joinTypes,
+                null, null, $policyPredicates, $aliases,
+            );
             foreach ($iter as $row) {
                 if ($wherePredicate !== null && !$wherePredicate($row)) {
                     continue;
@@ -711,9 +855,6 @@ $groupColumns = $statement['group'] ?? [];
                 $sortBytes += MemoryCache::estimateBytes($row);
                 if ($sortBytes > $sortLimit) {
                     throw new FoxyException('ORDER BY exceeded the configured sort memory limit.', 'RESOURCE_LIMIT');
-                }
-                if (count($matching) > $maximumRows) {
-                    throw new FoxyException('ORDER BY exceeded the configured in-memory row limit.', 'RESOURCE_LIMIT');
                 }
             }
             $orders = $statement['order'];
@@ -733,25 +874,36 @@ $groupColumns = $statement['group'] ?? [];
                 return 0;
             });
             $matching = array_slice($matching, $offset, $limit);
+            $matching = array_map(fn(array $row): array => $this->project($row, $projections), $matching);
             return ExecutionResult::rows($resultColumns, $matching);
         }
 
         if ($countProjection) {
             $count = 0;
-            foreach ($this->joinIterator($tables, $schemas, $columnMaps, $onPredicates, $joinTypes, null, null) as $_row) {
-                $count++;
+            foreach ($this->joinIterator(
+                $tables, $schemas, $columnMaps, $onPredicates, $joinTypes,
+                null, null, $policyPredicates, $aliases,
+            ) as $row) {
+                if ($wherePredicate === null || $wherePredicate($row)) {
+                    $count++;
+                }
             }
-            $count -= $offset;
-            if ($count <= 0) {
+            if ($offset > 0) {
                 return ExecutionResult::rows($resultColumns, []);
             }
             return ExecutionResult::rows($resultColumns, [[$projections[0]['alias'] => $count]]);
         }
 
-        $rows = (function () use ($tables, $schemas, $columnMaps, $onPredicates, $joinTypes, $wherePredicate, $projections, $offset, $limit, $maximumRows): \Generator {
+        $rows = (function () use (
+            $tables, $schemas, $columnMaps, $onPredicates, $joinTypes, $wherePredicate,
+            $projections, $offset, $limit, $policyPredicates, $aliases,
+        ): \Generator {
             $skipped = 0;
             $produced = 0;
-            foreach ($this->joinIterator($tables, $schemas, $columnMaps, $onPredicates, $joinTypes, null, null) as $row) {
+            foreach ($this->joinIterator(
+                $tables, $schemas, $columnMaps, $onPredicates, $joinTypes,
+                null, null, $policyPredicates, $aliases,
+            ) as $row) {
                 if ($wherePredicate !== null && !$wherePredicate($row)) {
                     continue;
                 }
@@ -762,27 +914,8 @@ $groupColumns = $statement['group'] ?? [];
                 if ($limit !== null && $produced >= $limit) {
                     break;
                 }
-                if ($produced >= $maximumRows) {
-                    throw new FoxyException('Result exceeded the configured row limit.', 'RESOURCE_LIMIT');
-                }
                 $produced++;
-                $projected = [];
-                foreach ($projections as $proj) {
-                    if ($proj['kind'] === 'column') {
-                        $found = null;
-                        if (str_contains($proj['column'], '.')) {
-                            $found = $row[$proj['column']] ?? null;
-                        } else {
-                            foreach ($row as $k => $v) {
-                                if (str_ends_with($k, '.' . $proj['column'])) {
-                                    $found = $v; break;
-                                }
-                            }
-                        }
-                        $projected[$proj['alias']] = $found;
-                    }
-                }
-                yield $projected;
+                yield $this->project($row, $projections);
             }
         })();
         return ExecutionResult::rows($resultColumns, $rows);
@@ -795,6 +928,11 @@ $groupColumns = $statement['group'] ?? [];
         $groups = [];
         $aggregators = $this->buildAggregators($projections);
         $resultColumns = array_column($projections, 'alias');
+        $temporaryBytes = 0;
+        $temporaryLimit = min(
+            (int) $this->systemValue('max_heap_table_size', 67_108_864),
+            (int) $this->systemValue('tmp_table_size', 67_108_864),
+        );
 
         foreach ($rows as $row) {
             $groupKey = $groupColumns === [] ? '' : implode("\0", array_map(
@@ -808,6 +946,11 @@ $groupColumns = $statement['group'] ?? [];
                 }
                 foreach ($aggregators as $i => $agg) {
                     $groups[$groupKey]['accumulators'][$i] = $agg['init']();
+                }
+                $temporaryBytes += MemoryCache::estimateBytes($groupKey)
+                    + MemoryCache::estimateBytes($groups[$groupKey]);
+                if ($temporaryBytes > $temporaryLimit) {
+                    throw new FoxyException('GROUP BY exceeded the configured temporary-table limit.', 'RESOURCE_LIMIT');
                 }
             }
             foreach ($aggregators as $i => $agg) {
@@ -830,7 +973,6 @@ $groupColumns = $statement['group'] ?? [];
         }
         $havPred = $having !== null ? $this->predicate($having, $havColumns, []) : null;
         $limit = $limit ?? PHP_INT_MAX;
-        $maxRows = $this->config->maxRowsPerResult;
 
         $results = [];
         foreach ($groups as $group) {
@@ -847,8 +989,9 @@ $groupColumns = $statement['group'] ?? [];
                 continue;
             }
             $results[] = $resultRow;
-            if (count($results) >= $maxRows) {
-                throw new FoxyException('Result exceeded the configured row limit.', 'RESOURCE_LIMIT');
+            $temporaryBytes += MemoryCache::estimateBytes($resultRow);
+            if ($temporaryBytes > $temporaryLimit) {
+                throw new FoxyException('Grouped result exceeded the configured temporary-table limit.', 'RESOURCE_LIMIT');
             }
         }
 
@@ -944,25 +1087,132 @@ $groupColumns = $statement['group'] ?? [];
     private function joinIterator(
         array $tables, array $schemas, array $columnMaps,
         array $onPredicates, array $joinTypes, ?\Closure $wherePredicate, ?array $projections,
+        array $policyPredicates = [],
+        array $aliases = [],
     ): \Generator {
+        if (in_array('right', $joinTypes, true)) {
+            yield from $this->joinMaterializedRight(
+                $tables, $schemas, $onPredicates, $joinTypes, $policyPredicates, $aliases,
+            );
+            return;
+        }
         $rowBuffer = [];
-        yield from $this->joinNested($tables, $schemas, $columnMaps, $onPredicates, $joinTypes, $rowBuffer, 0, $projections);
+        yield from $this->joinNested(
+            $tables, $schemas, $columnMaps, $onPredicates, $joinTypes,
+            $rowBuffer, 0, $projections, $policyPredicates, $aliases,
+        );
+    }
+
+    private function joinMaterializedRight(
+        array $tables,
+        array $schemas,
+        array $onPredicates,
+        array $joinTypes,
+        array $policyPredicates,
+        array $aliases,
+    ): \Generator {
+        $memoryLimit = min(
+            (int) $this->systemValue('join_buffer_size', 2_097_152),
+            (int) $this->systemValue('max_heap_table_size', 67_108_864),
+            (int) $this->systemValue('tmp_table_size', 67_108_864),
+        );
+        $current = $this->qualifiedVisibleRows(
+            $tables[0], $schemas[0], $aliases[0], $policyPredicates[0] ?? null,
+        );
+        for ($depth = 1; $depth < count($tables); $depth++) {
+            $rightRows = $this->qualifiedVisibleRows(
+                $tables[$depth], $schemas[$depth], $aliases[$depth],
+                $policyPredicates[$depth] ?? null,
+            );
+            $next = [];
+            $matchedRight = [];
+            $joinType = $joinTypes[$depth] ?? 'inner';
+            foreach ($current as $left) {
+                $matched = false;
+                foreach ($rightRows as $rightIndex => $right) {
+                    $candidate = $left + $right;
+                    $candidateBuffer = $candidate === [] ? [] : [$candidate];
+                    $evaluated = $this->mergeRowBuffer($candidateBuffer, null);
+                    if (isset($onPredicates[$depth]) && !$onPredicates[$depth]($evaluated)) {
+                        continue;
+                    }
+                    $matched = true;
+                    $matchedRight[$rightIndex] = true;
+                    $next[] = $candidate;
+                }
+                if (!$matched && $joinType === 'left') {
+                    $next[] = $left + $this->nullQualifiedRow($schemas[$depth], $aliases[$depth]);
+                }
+            }
+            if ($joinType === 'right') {
+                $nullLeft = [];
+                for ($leftDepth = 0; $leftDepth < $depth; $leftDepth++) {
+                    $nullLeft += $this->nullQualifiedRow($schemas[$leftDepth], $aliases[$leftDepth]);
+                }
+                foreach ($rightRows as $rightIndex => $right) {
+                    if (!isset($matchedRight[$rightIndex])) {
+                        $next[] = $nullLeft + $right;
+                    }
+                }
+            }
+            if (MemoryCache::estimateBytes($next) > $memoryLimit) {
+                throw new FoxyException('RIGHT JOIN exceeded its configured materialization limit.', 'RESOURCE_LIMIT');
+            }
+            $current = $next;
+        }
+        foreach ($current as $row) {
+            $rowBuffer = [$row];
+            yield $this->mergeRowBuffer($rowBuffer, null);
+        }
+    }
+
+    private function qualifiedVisibleRows(
+        Table $table,
+        array $schema,
+        string $alias,
+        ?\Closure $policy,
+    ): array {
+        $rows = [];
+        foreach ($table->rows() as $entry) {
+            if ($policy !== null && !$policy($entry['values'])) {
+                continue;
+            }
+            $qualified = [];
+            foreach ($entry['values'] as $column => $value) {
+                $qualified[$alias . '.' . $column] = $value;
+            }
+            $rows[] = $qualified;
+        }
+        return $rows;
+    }
+
+    private function nullQualifiedRow(array $schema, string $alias): array
+    {
+        $row = [];
+        foreach ($schema['columns'] as $column) {
+            $row[$alias . '.' . $column['name']] = null;
+        }
+        return $row;
     }
 
     private function joinNested(
         array $tables, array $schemas, array $columnMaps,
         array $onPredicates, array $joinTypes, array &$rowBuffer, int $depth, ?array $projections,
+        array $policyPredicates, array $aliases,
     ): \Generator {
-        $maxRows = $this->config->maxRowsPerResult;
         $table = $tables[$depth];
         $schema = $schemas[$depth];
-        $prefix = $schema['name'];
+        $prefix = $aliases[$depth] ?? $schema['name'];
         $joinType = $joinTypes[$depth] ?? 'inner';
 
         $scan = $table->rows(null);
         $anyMatch = false;
         foreach ($scan as $rowEntry) {
             $row = $rowEntry['values'];
+            if (($policyPredicates[$depth] ?? null) !== null
+                && !$policyPredicates[$depth]($row)) {
+                continue;
+            }
             $qualified = [];
             foreach ($row as $col => $val) {
                 $qualified[$prefix . '.' . $col] = $val;
@@ -978,11 +1228,14 @@ $groupColumns = $statement['group'] ?? [];
             $anyMatch = true;
 
             if ($depth < count($tables) - 1) {
-                yield from $this->joinNested($tables, $schemas, $columnMaps, $onPredicates, $joinTypes, $rowBuffer, $depth + 1, $projections);
+                yield from $this->joinNested(
+                    $tables, $schemas, $columnMaps, $onPredicates, $joinTypes,
+                    $rowBuffer, $depth + 1, $projections, $policyPredicates, $aliases,
+                );
             } elseif ($projections === null) {
-                yield $this->mergeRowBuffer($rowBuffer, null, $maxRows);
+                yield $this->mergeRowBuffer($rowBuffer, null);
             } else {
-                yield $this->mergeRowBuffer($rowBuffer, $projections, $maxRows);
+                yield $this->mergeRowBuffer($rowBuffer, $projections);
             }
         }
 
@@ -993,11 +1246,14 @@ $groupColumns = $statement['group'] ?? [];
             }
             $rowBuffer[$depth] = $nullRow;
             if ($depth < count($tables) - 1) {
-                yield from $this->joinNested($tables, $schemas, $columnMaps, $onPredicates, $joinTypes, $rowBuffer, $depth + 1, $projections);
+                yield from $this->joinNested(
+                    $tables, $schemas, $columnMaps, $onPredicates, $joinTypes,
+                    $rowBuffer, $depth + 1, $projections, $policyPredicates, $aliases,
+                );
             } elseif ($projections === null) {
-                yield $this->mergeRowBuffer($rowBuffer, null, $maxRows);
+                yield $this->mergeRowBuffer($rowBuffer, null);
             } else {
-                yield $this->mergeRowBuffer($rowBuffer, $projections, $maxRows);
+                yield $this->mergeRowBuffer($rowBuffer, $projections);
             }
         }
     }
@@ -1015,19 +1271,28 @@ $groupColumns = $statement['group'] ?? [];
         return $merged;
     }
 
-    private function mergeRowBuffer(array &$rowBuffer, ?array $projections, int $maxRows): array
+    private function mergeRowBuffer(array &$rowBuffer, ?array $projections): array
     {
         $merged = [];
+        $bareValues = [];
+        $ambiguous = [];
         foreach ($rowBuffer as $buf) {
             foreach ($buf as $k => $v) {
                 $merged[$k] = $v;
                 $dot = strpos($k, '.');
                 if ($dot !== false) {
                     $bare = substr($k, $dot + 1);
-                    if (!array_key_exists($bare, $merged)) {
-                        $merged[$bare] = $v;
+                    if (array_key_exists($bare, $bareValues)) {
+                        $ambiguous[$bare] = true;
+                    } else {
+                        $bareValues[$bare] = $v;
                     }
                 }
+            }
+        }
+        foreach ($bareValues as $bare => $value) {
+            if (!isset($ambiguous[$bare])) {
+                $merged[$bare] = $value;
             }
         }
         if ($projections === null) {
@@ -1065,14 +1330,38 @@ $groupColumns = $statement['group'] ?? [];
             return null;
         }
         $mergedColumns = [];
+        $counts = [];
+        foreach ($columnMaps as $map) {
+            foreach (array_keys($map) as $name) {
+                $counts[$name] = ($counts[$name] ?? 0) + 1;
+            }
+        }
+        $this->assertUnambiguousExpression($expression, $counts);
         foreach ($columnMaps as $i => $map) {
             $prefix = $aliases[$i];
             foreach ($map as $name => $col) {
                 $mergedColumns[$prefix . '.' . $name] = $col;
-                $mergedColumns[$name] = $col;
+                if (($counts[$name] ?? 0) === 1) {
+                    $mergedColumns[$name] = $col;
+                }
             }
         }
         return $this->predicate($expression, $mergedColumns, $parameters);
+    }
+
+    private function assertUnambiguousExpression(array $node, array $counts): void
+    {
+        if (($node['kind'] ?? null) === 'column') {
+            $name = $node['name'] ?? '';
+            if (is_string($name) && !str_contains($name, '.') && ($counts[$name] ?? 0) > 1) {
+                throw new FoxyException("Column {$name} is ambiguous.", 'AMBIGUOUS_COLUMN');
+            }
+        }
+        foreach ($node as $value) {
+            if (is_array($value)) {
+                $this->assertUnambiguousExpression($value, $counts);
+            }
+        }
     }
 
     private function update(array $statement, array $parameters): ExecutionResult
@@ -1094,6 +1383,16 @@ $groupColumns = $statement['group'] ?? [];
         }
         $predicate = $this->predicate($statement['where'], $columns, $parameters);
         $lookup = $this->lookup($table, $statement['where'], $columns, $parameters, $schema);
+        $oldRows = null;
+        if ($this->config->replicationEnabled && Replication::applicable($this->requireDatabase(), $statement['table'])) {
+            $oldRows = [];
+            foreach ($table->rows($lookup) as $entry) {
+                if ($predicate !== null && !$predicate($entry['values'])) {
+                    continue;
+                }
+                $oldRows[] = $entry['values'];
+            }
+        }
         if ($this->isSystemConfigTable($statement['table'])) {
             if (is_string($assignments['variable_name'] ?? null)
                 && SystemVariables::isManaged($assignments['variable_name'])) {
@@ -1113,11 +1412,20 @@ $groupColumns = $statement['group'] ?? [];
             });
         }
         try {
-            $affected = $table->update($assignments, $predicate, $lookup, $this->mutationMemoryLimit());
+            $affected = $table->update(
+                $assignments,
+                $predicate,
+                $lookup,
+                $this->mutationMemoryLimit(),
+                $this->writePolicyCheck('UPDATE', $statement, $schema),
+            );
         } finally {
             if ($this->inTransaction) {
                 $table->setUndoCallback(null);
             }
+        }
+        if ($oldRows !== null) {
+            $this->journalUpdate($this->requireDatabase(), $statement['table'], $schema, $assignments, $oldRows);
         }
         return ExecutionResult::command($affected);
     }
@@ -1130,6 +1438,16 @@ $groupColumns = $statement['group'] ?? [];
         $columns = $this->columnMap($schema);
         $predicate = $this->predicate($statement['where'], $columns, $parameters);
         $lookup = $this->lookup($table, $statement['where'], $columns, $parameters, $schema);
+        $oldRows = null;
+        if ($this->config->replicationEnabled && Replication::applicable($this->requireDatabase(), $statement['table'])) {
+            $oldRows = [];
+            foreach ($table->rows($lookup) as $entry) {
+                if ($predicate !== null && !$predicate($entry['values'])) {
+                    continue;
+                }
+                $oldRows[] = $entry['values'];
+            }
+        }
         if ($this->isSystemConfigTable($statement['table'])) {
             $predicate = $this->protectManagedVariables($predicate);
         }
@@ -1148,7 +1466,51 @@ $groupColumns = $statement['group'] ?? [];
                 $table->setUndoCallback(null);
             }
         }
+        if ($oldRows !== null) {
+            $keyColumns = Replication::keyColumns($schema);
+            $database = $this->requireDatabase();
+            if ($keyColumns === array_column($schema['columns'], 'name')) {
+                foreach ($oldRows as $row) {
+                    $this->journalChange(
+                        $database,
+                        $statement['table'],
+                        'DELETE',
+                        Replication::deleteOneSql($database, $statement['table'], $row),
+                    );
+                }
+            } else {
+                $this->journalChange(
+                    $database,
+                    $statement['table'],
+                    'DELETE',
+                    Replication::deleteKeysSql($database, $statement['table'], $keyColumns, $oldRows),
+                );
+            }
+        }
         return $result;
+    }
+
+    private function journalUpdate(string $database, string $table, array $schema, array $assignments, array $oldRows): void
+    {
+        $keyColumns = Replication::keyColumns($schema);
+        $hasPrimaryKey = $keyColumns !== array_column($schema['columns'], 'name');
+        if ($hasPrimaryKey) {
+            $this->journalChange(
+                $database,
+                $table,
+                'UPDATE',
+                Replication::updateKeysSql($database, $table, $assignments, $keyColumns, $oldRows),
+            );
+            return;
+        }
+        foreach ($oldRows as $row) {
+            $this->journalChange(
+                $database,
+                $table,
+                'UPDATE',
+                Replication::updateOneSql($database, $table, $assignments, $row),
+            );
+        }
     }
 
     private function beginTransaction(): ExecutionResult
@@ -1166,6 +1528,7 @@ $groupColumns = $statement['group'] ?? [];
         if (!$this->inTransaction) {
             throw new FoxyException('No active transaction.', 'TRANSACTION_INACTIVE');
         }
+        $this->flushPendingJournal();
         $this->txnUndo = [];
         $this->inTransaction = false;
         return ExecutionResult::command();
@@ -1188,6 +1551,7 @@ $groupColumns = $statement['group'] ?? [];
             }
         }
         $this->txnUndo = [];
+        $this->pendingJournal = [];
         $this->inTransaction = false;
         return ExecutionResult::command();
     }
@@ -1195,6 +1559,9 @@ $groupColumns = $statement['group'] ?? [];
     private function createRole(array $statement): ExecutionResult
     {
         $roleName = $statement['role'];
+        if ($this->resolveUserAccountId($roleName) !== null) {
+            throw new FoxyException("Role {$roleName} conflicts with an existing user.", 'AMBIGUOUS_GRANTEE');
+        }
         $roles = $this->storage->table(Authentication::SYSTEM_DATABASE, 'roles');
         try {
             $roles->insert(['role_name' => $roleName]);
@@ -1224,7 +1591,10 @@ $groupColumns = $statement['group'] ?? [];
         $assignments->delete(null, $assignments->lookupForEqualities(['role_id' => $roleId]));
         $privileges = $this->storage->table(Authentication::SYSTEM_DATABASE, 'privileges');
         $privileges->delete(null, $privileges->lookupForEqualities(['account_id' => $roleId]));
+        $policies = $this->storage->table(Authentication::SYSTEM_DATABASE, 'policies');
+        $policies->delete(null, $policies->lookupForEqualities(['scope_id' => $roleId]));
         $roles->delete(null, $lookup);
+        $this->invalidateRoleCaches();
         return ExecutionResult::command();
     }
 
@@ -1263,17 +1633,38 @@ $groupColumns = $statement['group'] ?? [];
             if ($roleId === null) {
                 throw new FoxyException("Role {$roleName} not found.", 'UNKNOWN_ROLE');
             }
+            $accountId = $this->resolveUserAccountId($grantee);
+            if ($accountId === null) {
+                throw new FoxyException("User {$grantee} not found.", 'UNKNOWN_GRANTEE');
+            }
             $assignments = $this->storage->table(Authentication::SYSTEM_DATABASE, 'role_assignments');
+            $assignments->delete(static fn(array $row): bool =>
+                $row['username'] === $grantee && $row['role_id'] === $roleId
+                    && !hash_equals((string) ($row['account_id'] ?? ''), $accountId)
+            );
             try {
-                $assignments->insert(['username' => $grantee, 'role_id' => $roleId]);
+                $assignments->insert([
+                    'username' => $grantee,
+                    'account_id' => $accountId,
+                    'role_id' => $roleId,
+                ]);
             } catch (FoxyException $e) {
                 if ($e->errorCode === 'UNIQUE_VIOLATION') {
                     throw new FoxyException("User {$grantee} already has role {$roleName}.", 'ROLE_ALREADY_GRANTED');
                 }
                 throw $e;
             }
+            $this->invalidateRoleCaches();
         }
         return ExecutionResult::command();
+    }
+
+    private function invalidateRoleCaches(): void
+    {
+        $this->sessionRoleNames = null;
+        if ($this->authentication !== null) {
+            $this->authentication->synchronizeAuthorizationCaches();
+        }
     }
 
     private function revokeStmt(array $statement): ExecutionResult
@@ -1302,10 +1693,15 @@ $groupColumns = $statement['group'] ?? [];
                 return ExecutionResult::command();
             }
             $assignments = $this->storage->table(Authentication::SYSTEM_DATABASE, 'role_assignments');
+            $accountId = $this->resolveUserAccountId($statement['grantee']);
+            if ($accountId === null) {
+                return ExecutionResult::command();
+            }
             $assignments->delete(null, $assignments->lookupForEqualities([
-                'username' => $statement['grantee'],
+                'account_id' => $accountId,
                 'role_id' => $roleId,
             ]));
+            $this->invalidateRoleCaches();
         }
         return ExecutionResult::command();
     }
@@ -1319,6 +1715,12 @@ $groupColumns = $statement['group'] ?? [];
             $database = $this->requireDatabase();
             $tableName = $table;
         }
+        if ($this->containsExpressionKind($statement['expression'], ['parameter', 'subquery', 'in_subquery', 'exists'])) {
+            throw new FoxyException('Policies cannot contain parameters or subqueries.', 'SQL_SEMANTIC');
+        }
+        $target = $this->storage->table($database, $tableName);
+        $this->booleanEvaluator($statement['expression'], $this->columnMap($target->schema()), []);
+        [$scopeType, $scopeId] = $this->resolvePolicyScope($statement['scope']);
         $policies = $this->storage->table(Authentication::SYSTEM_DATABASE, 'policies');
         $json = json_encode($statement['expression'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         try {
@@ -1327,6 +1729,9 @@ $groupColumns = $statement['group'] ?? [];
                 'database_name' => $database,
                 'table_name' => $tableName,
                 'operation' => $statement['operation'],
+                'username' => $statement['scope'],
+                'scope_type' => $scopeType,
+                'scope_id' => $scopeId,
                 'expression_sql' => $json === false ? null : $json,
             ]);
         } catch (FoxyException $e) {
@@ -1356,84 +1761,355 @@ $groupColumns = $statement['group'] ?? [];
         return ExecutionResult::command();
     }
 
+    private function deletePoliciesFor(string $database, ?string $table = null): void
+    {
+        if ($this->authentication === null) {
+            return;
+        }
+        $policies = $this->storage->table(Authentication::SYSTEM_DATABASE, 'policies');
+        $lookup = $table === null
+            ? $policies->lookupForEqualities(['database_name' => $database])
+            : $policies->lookupForEqualities(['database_name' => $database, 'table_name' => $table]);
+        $policies->delete(
+            static fn(array $row): bool => $row['database_name'] === $database
+                && ($table === null || $row['table_name'] === $table),
+            $lookup,
+        );
+    }
+
+    private function retargetPolicies(
+        string $database,
+        string $table,
+        string $targetDatabase,
+        string $targetTable,
+    ): void {
+        if ($this->authentication === null) {
+            return;
+        }
+        $policies = $this->storage->table(Authentication::SYSTEM_DATABASE, 'policies');
+        $policies->update(
+            ['database_name' => $targetDatabase, 'table_name' => $targetTable],
+            static fn(array $row): bool =>
+                $row['database_name'] === $database && $row['table_name'] === $table,
+            $policies->lookupForEqualities(['database_name' => $database, 'table_name' => $table]),
+        );
+    }
+
+    private function copyPolicies(
+        string $database,
+        string $table,
+        string $targetDatabase,
+        string $targetTable,
+    ): void {
+        if ($this->authentication === null) {
+            return;
+        }
+        $policies = $this->storage->table(Authentication::SYSTEM_DATABASE, 'policies');
+        $rows = [];
+        foreach ($policies->rows($policies->lookupForEqualities([
+            'database_name' => $database, 'table_name' => $table,
+        ])) as $entry) {
+            $rows[] = $entry['values'];
+        }
+        foreach ($rows as $row) {
+            unset($row['created_at']);
+            $row['database_name'] = $targetDatabase;
+            $row['table_name'] = $targetTable;
+            $policies->insert($row);
+        }
+    }
+
     private function resolveAccountId(string $name): ?string
+    {
+        $matches = [];
+        $users = $this->storage->table(Authentication::SYSTEM_DATABASE, 'users_schema');
+        $lookup = $users->lookupForEqualities(['username' => $name]);
+        foreach ($users->rows($lookup) as $entry) {
+            if ($entry['values']['username'] === $name) {
+                $matches[] = $entry['values']['account_id'];
+            }
+        }
+        $roles = $this->storage->table(Authentication::SYSTEM_DATABASE, 'roles');
+        $lookup = $roles->lookupForEqualities(['role_name' => $name]);
+        foreach ($roles->rows($lookup) as $entry) {
+            if ($entry['values']['role_name'] === $name) {
+                $matches[] = $entry['values']['role_id'];
+            }
+        }
+        if (count($matches) > 1) {
+            throw new FoxyException("Grantee {$name} is ambiguous.", 'AMBIGUOUS_GRANTEE');
+        }
+        return $matches[0] ?? null;
+    }
+
+    private function resolveUserAccountId(string $name): ?string
     {
         try {
             $users = $this->storage->table(Authentication::SYSTEM_DATABASE, 'users_schema');
-            $lookup = $users->lookupForEqualities(['username' => $name]);
-            foreach ($users->rows($lookup) as $entry) {
-                return $entry['values']['account_id'];
-            }
-        } catch (FoxyException) {
-        }
-        try {
-            $roles = $this->storage->table(Authentication::SYSTEM_DATABASE, 'roles');
-            $lookup = $roles->lookupForEqualities(['role_name' => $name]);
-            foreach ($roles->rows($lookup) as $entry) {
-                return $entry['values']['role_id'];
+            foreach ($users->rows($users->lookupForEqualities(['username' => $name])) as $entry) {
+                if ($entry['values']['username'] === $name && $entry['values']['enabled'] === true) {
+                    return $entry['values']['account_id'];
+                }
             }
         } catch (FoxyException) {
         }
         return null;
     }
 
+    /** @return array{?string, ?string} */
+    private function resolvePolicyScope(?string $scope): array
+    {
+        if ($scope === null || $scope === '') {
+            return [null, null];
+        }
+        $matches = [];
+        $accountId = $this->resolveUserAccountId($scope);
+        if ($accountId !== null) {
+            $matches[] = ['user', $accountId];
+        }
+        $roles = $this->storage->table(Authentication::SYSTEM_DATABASE, 'roles');
+        foreach ($roles->rows($roles->lookupForEqualities(['role_name' => $scope])) as $entry) {
+            if ($entry['values']['role_name'] === $scope) {
+                $matches[] = ['role', $entry['values']['role_id']];
+                break;
+            }
+        }
+        if ($matches === []) {
+            throw new FoxyException("Policy scope {$scope} does not exist.", 'UNKNOWN_GRANTEE');
+        }
+        if (count($matches) !== 1) {
+            throw new FoxyException("Policy scope {$scope} is ambiguous.", 'AMBIGUOUS_GRANTEE');
+        }
+        return $matches[0];
+    }
+
+    private function sessionRoleIds(): array
+    {
+        if ($this->username === null || $this->accountId === null) {
+            return [];
+        }
+        if ($this->authentication !== null) {
+            return $this->authentication->roleIdsFor($this->username, $this->accountId);
+        }
+        $ids = [];
+        $assignments = $this->storage->table(Authentication::SYSTEM_DATABASE, 'role_assignments');
+        foreach ($assignments->rows($assignments->lookupForEqualities(['account_id' => $this->accountId])) as $entry) {
+            if (hash_equals((string) $entry['values']['account_id'], $this->accountId)) {
+                $ids[] = $entry['values']['role_id'];
+            }
+        }
+        return $ids;
+    }
+
+    private function sessionRoles(): array
+    {
+        if ($this->username === null) {
+            return [];
+        }
+        if ($this->authentication !== null) {
+            return $this->authentication->roleNamesFor($this->username, $this->accountId);
+        }
+        $cached = $this->sessionRoleNames ?? null;
+        if ($cached !== null) {
+            return $cached;
+        }
+        $roles = [];
+        try {
+            $assignments = $this->storage->table(Authentication::SYSTEM_DATABASE, 'role_assignments');
+            $users = $this->storage->table(Authentication::SYSTEM_DATABASE, 'users_schema');
+            $accountId = null;
+            $userLookup = $users->lookupForEqualities(['username' => $this->username]);
+            foreach ($users->rows($userLookup) as $entry) {
+                if ($entry['values']['username'] === $this->username) {
+                    $accountId = $entry['values']['account_id'];
+                    break;
+                }
+            }
+            $roleTable = $this->storage->table(Authentication::SYSTEM_DATABASE, 'roles');
+            if ($accountId !== null) {
+                $lookup = $assignments->lookupForEqualities(['username' => $this->username]);
+                foreach ($assignments->rows($lookup) as $entry) {
+                    if ($entry['values']['username'] !== $this->username
+                        || !hash_equals((string) $entry['values']['account_id'], $accountId)) {
+                        continue;
+                    }
+                    $roleId = $entry['values']['role_id'];
+                    $roleLookup = $roleTable->lookupForEqualities(['role_id' => $roleId]);
+                    foreach ($roleTable->rows($roleLookup) as $roleEntry) {
+                        $roles[] = $roleEntry['values']['role_name'];
+                    }
+                }
+            }
+        } catch (FoxyException) {
+        }
+        $this->sessionRoleNames = $roles;
+        return $roles;
+    }
+
     private function enforcePolicies(string $operation, array &$statement): void
+    {
+        [$database, $tableName] = $this->policyTarget($statement);
+        if ($database === null) {
+            return;
+        }
+        $combined = $this->applicablePolicyExpression($operation, $database, $tableName);
+        if ($combined === null) {
+            return;
+        }
+        $existingWhere = $statement['where'] ?? null;
+        if ($existingWhere !== null) {
+            $combined = ['kind' => 'logical', 'operator' => 'and', 'left' => $existingWhere, 'right' => $combined];
+        }
+        $statement['where'] = $combined;
+    }
+
+    /**
+     * Resolves the table an operation targets into (database, table) names.
+     *
+     * @return array{?string, ?string}
+     */
+    private function policyTarget(array $statement): array
     {
         $table = $statement['table'] ?? null;
         if ($table === null) {
-            return;
+            return [null, null];
         }
         if (str_contains($table, '.')) {
             [$database, $tableName] = explode('.', $table, 2);
         } else {
             $database = $this->currentDatabase ?? '';
             if ($database === '') {
-                return;
+                return [null, null];
             }
             $tableName = $table;
         }
+        return [$database, $tableName];
+    }
+
+    /** @return array{string, string} */
+    private function tableTarget(string $table): array
+    {
+        if (str_contains($table, '.')) {
+            return explode('.', $table, 2);
+        }
+        return [$this->requireDatabase(), $table];
+    }
+
+    private function containsExpressionKind(array $node, array $kinds): bool
+    {
+        if (in_array($node['kind'] ?? null, $kinds, true)) {
+            return true;
+        }
+        foreach ($node as $value) {
+            if (is_array($value) && $this->containsExpressionKind($value, $kinds)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Builds a boolean evaluator closure that enforces the row-level policies
+     * applicable to the current session for a write operation. The closure
+     * receives a fully materialized row and returns true when the row may be
+     * written, and the operation is rejected otherwise.
+     *
+     * @param mixed $statement the parsed statement being executed
+     */
+    private function writePolicyCheck(string $operation, array $statement, array $schema): \Closure
+    {
+        [$database, $tableName] = $this->policyTarget($statement);
+        if ($database === null) {
+            return static fn(array $row): bool => true;
+        }
+        $combined = $this->applicablePolicyExpression($operation, $database, $tableName);
+        if ($combined === null) {
+            return static fn(array $row): bool => true;
+        }
+        $columns = $this->columnMap($schema);
+        $evaluator = $this->booleanEvaluator($combined, $columns, []);
+        return static function (array $row) use ($evaluator): bool {
+            return $evaluator($row) === true;
+        };
+    }
+
+    /**
+     * Returns the OR-combined expression of every row-level policy that applies
+     * to the current session for the given operation, or null when no policy
+     * applies. Policies scope to everyone, to the session username, or to any
+     * role the session holds; all applicable policies compose with OR, so a row
+     * passes when any one of them allows it.
+     */
+    private function applicablePolicyExpression(string $operation, string $database, string $tableName): ?array
+    {
+        if ($this->authentication === null) {
+            return null;
+        }
         try {
             $policies = $this->storage->table(Authentication::SYSTEM_DATABASE, 'policies');
-        } catch (FoxyException) {
-            return;
+        } catch (FoxyException $exception) {
+            throw new FoxyException('The row-policy store is unavailable.', 'STORAGE_CORRUPT', [], $exception);
         }
         try {
             $lookup = $policies->lookupForEqualities([
                 'database_name' => $database,
                 'table_name' => $tableName,
             ]);
-        } catch (FoxyException) {
-            return;
+        } catch (FoxyException $exception) {
+            throw new FoxyException('The row-policy index is unavailable.', 'STORAGE_CORRUPT', [], $exception);
         }
         $policyExprs = [];
+        $sessionRoleIds = $this->sessionRoleIds();
         foreach ($policies->rows($lookup) as $entry) {
             $row = $entry['values'];
+            if (!in_array($row['operation'] ?? null, ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'ALL'], true)) {
+                throw new FoxyException('A stored policy has an invalid operation.', 'STORAGE_CORRUPT');
+            }
             if ($row['operation'] !== 'ALL' && $row['operation'] !== $operation) {
                 continue;
             }
-            if ($row['expression_sql'] !== null) {
-                $expr = json_decode($row['expression_sql'], true);
-                if (is_array($expr)) {
-                    $policyExprs[] = $expr;
+            $scopeType = $row['scope_type'] ?? null;
+            $scopeId = $row['scope_id'] ?? null;
+            if (($row['username'] ?? null) !== null) {
+                if (!is_string($scopeType) || !is_string($scopeId)) {
+                    throw new FoxyException('A stored policy has an invalid scope.', 'STORAGE_CORRUPT');
+                }
+                if ($scopeType === 'user') {
+                    if ($this->accountId === null || !hash_equals($scopeId, $this->accountId)) {
+                        continue;
+                    }
+                } elseif ($scopeType === 'role') {
+                    if (!in_array($scopeId, $sessionRoleIds, true)) {
+                        continue;
+                    }
+                } else {
+                    throw new FoxyException('A stored policy has an invalid scope type.', 'STORAGE_CORRUPT');
                 }
             }
+            if ($row['expression_sql'] === null) {
+                throw new FoxyException('A stored policy has no expression.', 'STORAGE_CORRUPT');
+            }
+            $expr = json_decode($row['expression_sql'], true);
+            if (!is_array($expr)) {
+                throw new FoxyException('A stored policy expression is corrupt.', 'STORAGE_CORRUPT');
+            }
+            if ($this->containsExpressionKind($expr, ['parameter', 'subquery', 'in_subquery', 'exists'])) {
+                throw new FoxyException('A stored policy contains an unsafe expression.', 'STORAGE_CORRUPT');
+            }
+            $policyExprs[] = $expr;
         }
         if ($policyExprs === []) {
-            return;
+            return null;
         }
         $combined = null;
         foreach ($policyExprs as $expr) {
             if ($combined === null) {
                 $combined = $expr;
             } else {
-                $combined = ['kind' => 'binary', 'operator' => 'AND', 'left' => $combined, 'right' => $expr];
+                $combined = ['kind' => 'logical', 'operator' => 'or', 'left' => $combined, 'right' => $expr];
             }
         }
-        $existingWhere = $statement['where'] ?? null;
-        if ($existingWhere !== null) {
-            $combined = ['kind' => 'binary', 'operator' => 'AND', 'left' => $existingWhere, 'right' => $combined];
-        }
-        $statement['where'] = $combined;
+        return $combined;
     }
 
     private function expressionToSql(?array $node): ?string
@@ -1468,7 +2144,19 @@ $groupColumns = $statement['group'] ?? [];
 
     private function truncate(array $statement): ExecutionResult
     {
+        $database = $this->requireDatabase();
+        [$policyDatabase, $tableName] = $this->policyTarget($statement);
+        if ($policyDatabase !== null
+            && $this->applicablePolicyExpression('DELETE', $policyDatabase, $tableName) !== null) {
+            throw new FoxyException('TRUNCATE cannot bypass row-level DELETE policies.', 'POLICY_VIOLATION');
+        }
         $this->table($statement['table'])->truncate();
+        $this->journalChange(
+            $database,
+            $statement['table'],
+            'TRUNCATE',
+            Replication::truncateSql($database, $statement['table']),
+        );
         return ExecutionResult::command();
     }
 
@@ -1513,7 +2201,19 @@ $groupColumns = $statement['group'] ?? [];
             $database = $this->requireDatabase();
             $name = $table;
         }
-        $this->storage->renameTable($database, $name, $statement['new_name']);
+        $this->retargetPolicies($database, $name, $database, $statement['new_name']);
+        try {
+            $this->storage->renameTable($database, $name, $statement['new_name']);
+        } catch (\Throwable $exception) {
+            $this->retargetPolicies($database, $statement['new_name'], $database, $name);
+            throw $exception;
+        }
+        $this->journalChange(
+            $database,
+            $name,
+            'RENAME_TABLE',
+            Replication::renameTableSql($database, $name, $statement['new_name']),
+        );
         return ExecutionResult::command(metadata: [
             'old_name' => $name,
             'new_name' => $statement['new_name'],
@@ -1529,12 +2229,26 @@ $groupColumns = $statement['group'] ?? [];
             $database = $this->requireDatabase();
             $name = $table;
         }
-        $this->storage->moveTable($database, $name, $statement['target_database'], $statement['target_table']);
+        $targetDatabase = $statement['target_database'];
+        $targetTable = $statement['target_table'] ?? $name;
+        $this->retargetPolicies($database, $name, $targetDatabase, $targetTable);
+        try {
+            $this->storage->moveTable($database, $name, $targetDatabase, $targetTable);
+        } catch (\Throwable $exception) {
+            $this->retargetPolicies($targetDatabase, $targetTable, $database, $name);
+            throw $exception;
+        }
+        $this->journalChange(
+            $database,
+            $name,
+            'MOVE_TABLE',
+            Replication::moveTableSql($database, $name, $targetDatabase, $targetTable),
+        );
         return ExecutionResult::command(metadata: [
             'database' => $database,
             'table' => $name,
-            'target_database' => $statement['target_database'],
-            'target_table' => $statement['target_table'] ?? $name,
+            'target_database' => $targetDatabase,
+            'target_table' => $targetTable,
         ]);
     }
 
@@ -1547,12 +2261,26 @@ $groupColumns = $statement['group'] ?? [];
             $database = $this->requireDatabase();
             $name = $table;
         }
-        $this->storage->copyTable($database, $name, $statement['target_database'], $statement['target_table']);
+        $targetDatabase = $statement['target_database'];
+        $targetTable = $statement['target_table'] ?? $name;
+        $this->storage->copyTable($database, $name, $targetDatabase, $targetTable);
+        try {
+            $this->copyPolicies($database, $name, $targetDatabase, $targetTable);
+        } catch (\Throwable $exception) {
+            $this->storage->dropTable($targetDatabase, $targetTable, true);
+            throw $exception;
+        }
+        $this->journalChange(
+            $database,
+            $name,
+            'COPY_TABLE',
+            Replication::copyTableSql($database, $name, $targetDatabase, $targetTable),
+        );
         return ExecutionResult::command(metadata: [
             'database' => $database,
             'table' => $name,
-            'target_database' => $statement['target_database'],
-            'target_table' => $statement['target_table'] ?? $name,
+            'target_database' => $targetDatabase,
+            'target_table' => $targetTable,
         ]);
     }
 
@@ -1597,6 +2325,7 @@ $groupColumns = $statement['group'] ?? [];
 
     private function executeSelectAllRows(array $statement, array $parameters = []): array
     {
+        $this->authorize($statement);
         $result = $this->select($statement, $parameters);
         if (is_array($result->rows)) {
             return $result->rows;
@@ -1955,7 +2684,105 @@ $groupColumns = $statement['group'] ?? [];
             return null;
         }
         $equalities = $this->equalities($expression, $columns, $parameters);
-        return $equalities === [] ? null : $table->lookupForEqualities($equalities, $schema);
+        if ($equalities !== []) {
+            return $table->lookupForEqualities($equalities, $schema);
+        }
+        foreach ($this->rangeBounds($expression, $columns, $parameters) as $column => $bound) {
+            foreach ($schema['indexes'] as $index) {
+                if (($index['ordered'] ?? false) !== true
+                    || $index['columns'] !== [$column]) {
+                    continue;
+                }
+                return [
+                    'name' => $index['name'],
+                    'range' => [
+                        'name' => $index['name'],
+                        'minimum' => $bound['minimum'] === null
+                            ? null
+                            : IndexStore::orderedKey([$bound['minimum']]),
+                        'maximum' => $bound['maximum'] === null
+                            ? null
+                            : IndexStore::orderedKey([$bound['maximum']]),
+                        'min_inclusive' => $bound['min_inclusive'],
+                        'max_inclusive' => $bound['max_inclusive'],
+                    ],
+                ];
+            }
+        }
+        return null;
+    }
+
+    private function rangeBounds(array $expression, array $columns, array $parameters): array
+    {
+        if ($expression['kind'] === 'logical' && $expression['operator'] === 'and') {
+            return $this->rangeBounds($expression['left'], $columns, $parameters)
+                + $this->rangeBounds($expression['right'], $columns, $parameters);
+        }
+        if ($expression['kind'] !== 'comparison'
+            || !in_array($expression['operator'], ['>', '>=', '<', '<='], true)) {
+            return [];
+        }
+        $left = $expression['left'];
+        $right = $expression['right'];
+        if ($left['kind'] === 'column' && in_array($right['kind'], ['literal', 'parameter'], true)) {
+            $column = $left['name'];
+            $node = $right;
+            $operator = $expression['operator'];
+        } elseif ($right['kind'] === 'column' && in_array($left['kind'], ['literal', 'parameter'], true)) {
+            $column = $right['name'];
+            $node = $left;
+            $operator = [
+                '>' => '<',
+                '>=' => '<=',
+                '<' => '>',
+                '<=' => '>=',
+            ][$expression['operator']];
+        } else {
+            return [];
+        }
+        if (!isset($columns[$column])) {
+            throw new FoxyException("Unknown column: {$column}", 'UNKNOWN_COLUMN');
+        }
+        $value = $this->value($node, $parameters);
+        if ($value === null) {
+            return [];
+        }
+        $value = $this->types->materialize($this->types->coerce($value, $columns[$column]));
+        return $this->mergeRangeBound($column, $value, $operator, []);
+    }
+
+    private function mergeRangeBound(string $column, mixed $value, string $operator, array $bounds): array
+    {
+        $isMinimum = $operator === '>' || $operator === '>=';
+        $bound = $bounds[$column] ?? [
+            'minimum' => null,
+            'maximum' => null,
+            'min_inclusive' => false,
+            'max_inclusive' => false,
+        ];
+        $existing = $isMinimum ? $bound['minimum'] : $bound['maximum'];
+        $inclusive = $operator === '>=' || $operator === '<=';
+        if ($existing !== null) {
+            $comparison = $this->types->compare($value, $existing);
+            $replace = $isMinimum ? $comparison > 0 : $comparison < 0;
+            if (!$replace) {
+                if ($comparison === 0) {
+                    $bound[$isMinimum ? 'min_inclusive' : 'max_inclusive'] =
+                        $bound[$isMinimum ? 'min_inclusive' : 'max_inclusive'] && $inclusive;
+                }
+                $bounds[$column] = $bound;
+                return $bounds;
+            }
+        }
+        if ($isMinimum) {
+            $bound['minimum'] = $value;
+            $bound['min_inclusive'] = $inclusive;
+        } else {
+            $bound['maximum'] = $value;
+            $bound['max_inclusive'] = $inclusive;
+        }
+        $bounds[$column] = $bound;
+        return $bounds;
     }
 
     private function equalities(array $expression, array $columns, array $parameters): array
@@ -2134,7 +2961,9 @@ $groupColumns = $statement['group'] ?? [];
                 $parts = explode('.', $column);
                 $base = count($parts) === 2 ? $parts[1] : $column;
                 $raw = $this->types->materialize(
-                    array_key_exists($base, $row) ? $row[$base] : ($row[$column] ?? null),
+                    str_contains($column, '.')
+                        ? ($row[$column] ?? null)
+                        : ($row[$base] ?? null),
                 );
                 $extracted = self::extractJson($raw, $projection['json_tokens']);
                 $result[$projection['alias']] = is_array($extracted)
@@ -2144,7 +2973,9 @@ $groupColumns = $statement['group'] ?? [];
                 $column = $projection['column'];
                 $parts = explode('.', $column);
                 $base = count($parts) === 2 ? $parts[1] : $column;
-                $result[$projection['alias']] = array_key_exists($base, $row) ? $row[$base] : ($row[$column] ?? null);
+                $result[$projection['alias']] = str_contains($column, '.')
+                    ? ($row[$column] ?? null)
+                    : ($row[$base] ?? null);
             }
         }
         return $result;
@@ -2186,6 +3017,19 @@ $groupColumns = $statement['group'] ?? [];
         return $this->currentDatabase;
     }
 
+    private function resolveStatementDatabase(array $statement): string
+    {
+        $table = $statement['table'] ?? null;
+        if (is_string($table) && str_contains($table, '.')) {
+            [$database, $name] = explode('.', $table, 2);
+            return $database;
+        }
+        if (isset($statement['database'])) {
+            return $statement['database'];
+        }
+        return $this->currentDatabase ?? '*';
+    }
+
     private function authorize(array $statement): void
     {
         if ($this->authentication === null) {
@@ -2199,6 +3043,44 @@ $groupColumns = $statement['group'] ?? [];
         if (in_array($type, ['begin', 'commit', 'rollback'], true)) {
             return;
         }
+        if (in_array($type, ['create_role', 'drop_role', 'grant', 'revoke'], true)) {
+            [$privilege, $table] = match ($type) {
+                'create_role' => ['CREATE', 'roles'],
+                'drop_role' => ['DROP', 'roles'],
+                default => ['ALTER', 'privileges'],
+            };
+            $this->authentication->assertPrivilege(
+                $this->username,
+                $privilege,
+                Authentication::SYSTEM_DATABASE,
+                $table,
+                $this->accountId,
+            );
+            return;
+        }
+        if (in_array($type, ['create_policy', 'drop_policy'], true)) {
+            [$policyDatabase, $policyTable] = $this->tableTarget($statement['table']);
+            $this->authentication->assertPrivilege(
+                $this->username, 'ALTER', $policyDatabase, $policyTable, $this->accountId,
+            );
+            return;
+        }
+        if (in_array($type, ['move_table', 'copy_table'], true)) {
+            [$sourceDatabase, $sourceTable] = $this->tableTarget($statement['table']);
+            $this->authentication->assertPrivilege(
+                $this->username, 'ALTER', $sourceDatabase, $sourceTable, $this->accountId,
+            );
+            if ($type === 'copy_table') {
+                $this->authentication->assertPrivilege(
+                    $this->username, 'SELECT', $sourceDatabase, $sourceTable, $this->accountId,
+                );
+            }
+            $this->authentication->assertPrivilege(
+                $this->username, 'CREATE', $statement['target_database'],
+                $statement['target_table'] ?? $sourceTable, $this->accountId,
+            );
+            return;
+        }
         $database = match ($type) {
             'create_database', 'drop_database', 'use' => $statement['database'],
             'show_tables' => $statement['database'] ?? $this->currentDatabase ?? '*',
@@ -2206,11 +3088,18 @@ $groupColumns = $statement['group'] ?? [];
             'set_variable' => $statement['scope'] === 'GLOBAL'
                 ? Authentication::SYSTEM_DATABASE
                 : $this->currentDatabase ?? '*',
+            'delete', 'drop_table', 'truncate', 'create_table', 'rename_table',
+            'move_table', 'copy_table', 'alter_table', 'insert', 'update',
+            'create_index', 'drop_index', 'describe', 'show_indexes'
+                => $this->resolveStatementDatabase($statement),
             default => $this->currentDatabase ?? '*',
         };
         $table = $type === 'set_variable' && $statement['scope'] === 'GLOBAL'
             ? 'sys_config'
             : ($statement['table'] ?? '*');
+        if (is_string($table) && str_contains($table, '.')) {
+            [, $table] = explode('.', $table, 2);
+        }
         $privilege = match ($type) {
             'show_databases', 'show_tables', 'show_variables' => 'SHOW',
             'set_variable' => 'ALTER',
@@ -2221,14 +3110,13 @@ $groupColumns = $statement['group'] ?? [];
             'describe', 'show_indexes', 'select' => 'SELECT',
             'insert' => 'INSERT',
             'update' => 'UPDATE',
-            'delete', 'truncate' => 'DELETE',
+            'delete' => 'DELETE',
+            'truncate' => 'TRUNCATE',
             'compact', 'optimize', 'defragment', 'alter_table', 'set_auto_increment', 'set_collation' => 'ALTER',
             'create_role', 'drop_role', 'grant', 'revoke' => 'CREATE',
             'create_policy', 'drop_policy' => 'CREATE',
             'rename_table', 'move_table', 'copy_table' => 'ALTER',
-            'analyze' => 'ALTER',
-            'check' => 'SELECT',
-            'checksum' => 'SELECT',
+            'analyze', 'check', 'checksum' => 'ALTER',
             'flush' => 'ALTER',
             default => throw new FoxyException('Unsupported authorization target.', 'ACCESS_DENIED'),
         };
@@ -2254,6 +3142,19 @@ $groupColumns = $statement['group'] ?? [];
             }
         }
         if ($type === 'set_variable' && $statement['scope'] === 'SESSION') {
+            return;
+        }
+        if ($type === 'select' && count($statement['from'] ?? []) > 1) {
+            foreach ($statement['from'] as $source) {
+                [$sourceDatabase, $sourceTable] = $this->tableTarget($source['table']);
+                $this->authentication->assertPrivilege(
+                    $this->username,
+                    'SELECT',
+                    $sourceDatabase,
+                    $sourceTable,
+                    $this->accountId,
+                );
+            }
             return;
         }
         $this->authentication->assertPrivilege(
@@ -2349,6 +3250,7 @@ $groupColumns = $statement['group'] ?? [];
             }
         } finally {
             $this->txnUndo = [];
+            $this->pendingJournal = [];
             $this->inTransaction = false;
             $this->currentDatabase = null;
             $this->username = null;
@@ -2393,7 +3295,11 @@ $groupColumns = $statement['group'] ?? [];
 
     private function queryCacheKey(array $statement, string $sql, array $parameters): ?string
     {
-        if ($this->systemVariables === null || (int) $this->systemValue('query_cache_size', 0) === 0) {
+        if ($this->inTransaction || $this->systemVariables === null
+            || (int) $this->systemValue('query_cache_size', 0) === 0) {
+            return null;
+        }
+        if ($this->containsExpressionKind($statement, ['subquery', 'in_subquery', 'exists'])) {
             return null;
         }
         if ($this->containsVolatileExpression($statement)) {
@@ -2404,15 +3310,47 @@ $groupColumns = $statement['group'] ?? [];
                 return null;
             }
         }
+        $policyFingerprint = '';
+        try {
+            $roles = $this->sessionRoles();
+            sort($roles, SORT_STRING);
+            $policyFingerprint = implode('|', [
+                $this->username ?? '',
+                $this->accountId ?? '',
+                $this->storage->tableRevision(Authentication::SYSTEM_DATABASE, 'users_schema'),
+                $this->storage->tableRevision(Authentication::SYSTEM_DATABASE, 'policies'),
+                $this->storage->tableRevision(Authentication::SYSTEM_DATABASE, 'roles'),
+                $this->storage->tableRevision(Authentication::SYSTEM_DATABASE, 'role_assignments'),
+                implode(',', $roles),
+            ]);
+        } catch (FoxyException) {
+            return null;
+        }
+        $revisions = [];
+        foreach ($statement['from'] ?? [] as $source) {
+            [$revisionDatabase, $revisionTable] = $this->tableTarget($source['table']);
+            $revisions[$revisionDatabase . '.' . $revisionTable] =
+                $this->storage->tableRevision($revisionDatabase, $revisionTable);
+        }
+        if ($revisions === []) {
+            $table = $statement['table'] ?? null;
+            $revisionDatabase = $this->currentDatabase;
+            if ($table !== null && str_contains($table, '.')) {
+                [$revisionDatabase, $table] = explode('.', $table, 2);
+            }
+            $revisions[(string) $revisionDatabase . '.' . (string) $table] = $revisionDatabase === null
+                ? 0
+                : $this->storage->tableRevision($revisionDatabase, $table ?? '');
+        }
+        ksort($revisions, SORT_STRING);
         return hash('sha256', serialize([
             $this->currentDatabase,
-            $this->currentDatabase === null
-                ? 0
-                : $this->storage->tableRevision($this->currentDatabase, $statement['table']),
+            $revisions,
             $this->accountId,
             $sql,
             $parameters,
             $this->sessionVariables,
+            $policyFingerprint,
         ]));
     }
 

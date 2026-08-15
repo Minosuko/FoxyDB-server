@@ -17,11 +17,7 @@ final class FrameCodec
     private const MAGIC = 'FXDB';
     private const KIND_VALUE = 1;
     private const MAXIMUM_DEPTH = 64;
-    private const MAXIMUM_CONTAINER_ITEMS = 65_536;
     private const MAXIMUM_AGGREGATE_ITEMS = 100_000;
-    private const MAXIMUM_KEY_BYTES = 1_024;
-    private const UINT32_BASE = 4_294_967_296;
-
     private const NULL = 0;
     private const FALSE = 1;
     private const TRUE = 2;
@@ -34,7 +30,6 @@ final class FrameCodec
 
     public static function encode(array $payload, int $maximumBytes): string
     {
-        self::require64BitIntegers();
         if ($payload === [] || array_is_list($payload)) {
             throw new FoxyException('Protocol frames require a non-empty map.', 'PROTOCOL_ERROR');
         }
@@ -49,7 +44,6 @@ final class FrameCodec
 
     public static function extract(string &$buffer, int $maximumBytes): ?array
     {
-        self::require64BitIntegers();
         if (strlen($buffer) < 4) {
             return null;
         }
@@ -79,7 +73,6 @@ final class FrameCodec
 
     public static function read($stream, int $maximumBytes): array
     {
-        self::require64BitIntegers();
         $header = self::readNetworkExact($stream, self::HEADER_BYTES);
         $length = self::payloadLength($header, $maximumBytes);
         $body = self::readNetworkExact($stream, $length, true);
@@ -89,7 +82,6 @@ final class FrameCodec
 
     public static function encodedValueBytes(mixed $value, int $maximumBytes = 1_073_741_824): int
     {
-        self::require64BitIntegers();
         $remainingItems = self::MAXIMUM_AGGREGATE_ITEMS;
         return strlen(self::encodeValue($value, 0, $remainingItems, $maximumBytes));
     }
@@ -142,7 +134,7 @@ final class FrameCodec
         }
 
         $count = count($value);
-        if ($count > self::MAXIMUM_CONTAINER_ITEMS || $count > $remainingItems) {
+        if ($count > $remainingItems) {
             throw new FoxyException('Protocol value contains too many items.', 'PROTOCOL_ERROR');
         }
         $remainingItems -= $count;
@@ -165,9 +157,6 @@ final class FrameCodec
             }
             self::assertUtf8($key, 'Protocol map key is not valid UTF-8.');
             $keyBytes = strlen($key);
-            if ($keyBytes > self::MAXIMUM_KEY_BYTES) {
-                throw new FoxyException('Protocol map key exceeds its limit.', 'PROTOCOL_ERROR');
-            }
             self::appendBounded($encoded, pack('N', $keyBytes) . $key, $maximumBytes);
             self::appendBounded(
                 $encoded,
@@ -237,7 +226,7 @@ final class FrameCodec
         }
 
         $count = self::readUnsigned32($body, $offset);
-        if ($count > self::MAXIMUM_CONTAINER_ITEMS || $count > $remainingItems) {
+        if ($count > $remainingItems) {
             throw new FoxyException('Protocol value contains too many items.', 'PROTOCOL_ERROR');
         }
         $remainingItems -= $count;
@@ -257,9 +246,6 @@ final class FrameCodec
         $seen = [];
         for ($index = 0; $index < $count; $index++) {
             $keyLength = self::readUnsigned32($body, $offset);
-            if ($keyLength > self::MAXIMUM_KEY_BYTES) {
-                throw new FoxyException('Protocol map key exceeds its limit.', 'PROTOCOL_ERROR');
-            }
             $key = self::take($body, $offset, $keyLength);
             self::assertUtf8($key, 'Protocol map key is not valid UTF-8.');
             if ($key === '' || self::isNumericMapKey($key) || isset($seen["\0" . $key])) {
@@ -280,9 +266,14 @@ final class FrameCodec
             || ord($header[4]) !== self::VERSION || ord($header[5]) !== self::KIND_VALUE) {
             throw new FoxyException('Invalid binary protocol header.', 'PROTOCOL_ERROR');
         }
-        $fields = unpack('nflags/Nlength', substr($header, 6, 6));
+        $fields = unpack('nflags/nhigh/nlow', substr($header, 6, 6));
         $flags = (int) ($fields['flags'] ?? -1);
-        $length = (int) ($fields['length'] ?? -1);
+        $high = (int) ($fields['high'] ?? -1);
+        $low = (int) ($fields['low'] ?? -1);
+        if ($high < 0 || $low < 0 || $high > intdiv(PHP_INT_MAX - $low, 65_536)) {
+            throw new FoxyException('Protocol frame length exceeds this platform limit.', 'FRAME_TOO_LARGE');
+        }
+        $length = $high * 65_536 + $low;
         if ($flags !== 0 || $length < 5) {
             throw new FoxyException('Invalid binary protocol flags or length.', 'PROTOCOL_ERROR');
         }
@@ -329,8 +320,13 @@ final class FrameCodec
 
     private static function readUnsigned32(string $body, int &$offset): int
     {
-        $decoded = unpack('Nvalue', self::take($body, $offset, 4));
-        return (int) ($decoded['value'] ?? 0);
+        $decoded = unpack('nhigh/nlow', self::take($body, $offset, 4));
+        $high = (int) ($decoded['high'] ?? 0);
+        $low = (int) ($decoded['low'] ?? 0);
+        if ($high > intdiv(PHP_INT_MAX - $low, 65_536)) {
+            throw new FoxyException('Protocol integer exceeds this platform limit.', 'PROTOCOL_ERROR');
+        }
+        return $high * 65_536 + $low;
     }
 
     private static function take(string $body, int &$offset, int $length): string
@@ -346,22 +342,36 @@ final class FrameCodec
 
     private static function signedInteger(int $value): string
     {
-        return pack('NN', ($value >> 32) & 0xffffffff, $value & 0xffffffff);
+        $words = [0, 0, 0, 0];
+        for ($index = 3; $index >= 0; $index--) {
+            $words[$index] = $value & 0xffff;
+            $value >>= 16;
+        }
+        return pack('nnnn', ...$words);
     }
 
     private static function readSignedInteger(string $bytes): int
     {
-        $parts = unpack('Nhigh/Nlow', $bytes);
-        $high = (int) ($parts['high'] ?? 0);
-        $low = (int) ($parts['low'] ?? 0);
-        if (($high & 0x80000000) === 0) {
-            return (int) ($high * self::UINT32_BASE + $low);
+        $parts = unpack('n4', $bytes);
+        if ($parts === false || count($parts) !== 4) {
+            throw new FoxyException('Protocol integer is invalid.', 'PROTOCOL_ERROR');
         }
-        if ($high === 0x80000000 && $low === 0) {
-            return PHP_INT_MIN;
+        $words = array_values($parts);
+        if (PHP_INT_SIZE === 4) {
+            $negative = ($words[0] & 0x8000) !== 0;
+            $extension = $negative ? 0xffff : 0;
+            if ($words[0] !== $extension || $words[1] !== $extension
+                || ($negative !== (($words[2] & 0x8000) !== 0))) {
+                throw new FoxyException('Protocol integer exceeds this platform limit.', 'PROTOCOL_ERROR');
+            }
+            return ($words[2] - ($negative ? 65_536 : 0)) * 65_536 + $words[3];
         }
-        $magnitude = (0xffffffff - $high) * self::UINT32_BASE + (0xffffffff - $low) + 1;
-        return -(int) $magnitude;
+        $negative = ($words[0] & 0x8000) !== 0;
+        $value = $words[0] - ($negative ? 65_536 : 0);
+        for ($index = 1; $index < 4; $index++) {
+            $value = $value * 65_536 + $words[$index];
+        }
+        return $value;
     }
 
     private static function assertUtf8(string $value, string $message): void
@@ -374,13 +384,6 @@ final class FrameCodec
     private static function isNumericMapKey(string $key): bool
     {
         return preg_match('/^(?:0|-?[1-9][0-9]*)$/', $key) === 1;
-    }
-
-    private static function require64BitIntegers(): void
-    {
-        if (PHP_INT_SIZE < 8) {
-            throw new FoxyException('Binary protocol version 2 requires 64-bit PHP.', 'INVALID_CONFIG');
-        }
     }
 
     private static function readNetworkExact($stream, int $length, bool $frameStarted = false): string

@@ -232,6 +232,51 @@ try {
         throw new RuntimeException('JSON_EXTRACT failed on a large chunked document.');
     }
 
+    $session->execute('CREATE TABLE join_a (id INT PRIMARY KEY, label VARCHAR(20), secret VARCHAR(20))');
+    $session->execute('CREATE TABLE join_b (a_id INT PRIMARY KEY, detail VARCHAR(20))');
+    $session->execute("INSERT INTO join_a (id, label, secret) VALUES (1, 'one', 's1'), (2, 'two', 's2')");
+    $session->execute("INSERT INTO join_b (a_id, detail) VALUES (1, 'first'), (3, 'orphan')");
+    $aliased = iterator_to_array($session->execute(
+        'SELECT a.label AS label, b.detail AS detail FROM join_a AS a '
+        . 'JOIN join_b AS b ON a.id = b.a_id ORDER BY a_id'
+    )->rows, false);
+    if ($aliased !== [['label' => 'one', 'detail' => 'first']]) {
+        throw new RuntimeException('Aliased bare JOIN returned incorrect rows.');
+    }
+    $orderedProjection = iterator_to_array($session->execute(
+        'SELECT a.label AS label FROM join_a AS a INNER JOIN join_b AS b '
+        . 'ON a.id = b.a_id ORDER BY a_id'
+    )->rows, false);
+    if ($orderedProjection !== [['label' => 'one']] || array_keys($orderedProjection[0]) !== ['label']) {
+        throw new RuntimeException('Ordered JOIN disclosed unprojected columns.');
+    }
+    $leftRows = iterator_to_array($session->execute(
+        'SELECT a.label AS label, b.detail AS detail FROM join_a AS a '
+        . 'LEFT JOIN join_b AS b ON a.id = b.a_id'
+    )->rows, false);
+    if ($leftRows !== [
+        ['label' => 'one', 'detail' => 'first'],
+        ['label' => 'two', 'detail' => null],
+    ]) {
+        throw new RuntimeException('LEFT JOIN returned incorrect unmatched rows.');
+    }
+    $rightRows = iterator_to_array($session->execute(
+        'SELECT a.label AS label, b.detail AS detail FROM join_a AS a '
+        . 'RIGHT JOIN join_b AS b ON a.id = b.a_id'
+    )->rows, false);
+    if ($rightRows !== [
+        ['label' => 'one', 'detail' => 'first'],
+        ['label' => null, 'detail' => 'orphan'],
+    ]) {
+        throw new RuntimeException('RIGHT JOIN returned incorrect unmatched rows.');
+    }
+    $crossRows = iterator_to_array($session->execute(
+        'SELECT a.id AS id FROM join_a AS a CROSS JOIN join_b AS b'
+    )->rows, false);
+    if (count($crossRows) !== 4) {
+        throw new RuntimeException('CROSS JOIN without ON returned incorrect rows.');
+    }
+
     echo "sql smoke: ok\n";
 } finally {
     if (isset($storage)) {

@@ -37,7 +37,6 @@ $serverEnvironment = getenv();
 if (!is_array($serverEnvironment)) {
     $serverEnvironment = [];
 }
-$serverEnvironment['FOXYDB_MAX_RESULT_ROWS'] = '10';
 $process = proc_open(
     $command,
     $descriptors,
@@ -269,7 +268,7 @@ try {
     if (file_put_contents($uploadPath, $upload) !== strlen($upload)) {
         throw new RuntimeException('Unable to prepare upload fixture.');
     }
-    $reference = $client->uploadFile($uploadPath, 'binary');
+    $reference = $client->uploadFile($uploadPath, 'binary', str_repeat('transfer_', 32));
     $inserted = $client->query('INSERT INTO files (name, body) VALUES (?, ?)', ['payload', $reference]);
     if ($inserted->lastInsertId !== 1) {
         throw new RuntimeException('TCP INSERT did not return its identifier.');
@@ -320,13 +319,9 @@ try {
     );
     $limitClient = Client::connect('127.0.0.1', $port, 'root', 'root', 1.0);
     $limitClient->query('USE network');
-    try {
-        $limitClient->query('SELECT id, value FROM overflow_rows');
-        throw new RuntimeException('Streamed result row limit was not enforced.');
-    } catch (FoxyException $exception) {
-        if ($exception->errorCode !== 'RESOURCE_LIMIT') {
-            throw $exception;
-        }
+    $overflowResult = $limitClient->query('SELECT id, value FROM overflow_rows');
+    if (count(iterator_to_array($overflowResult->rows, false)) !== 11) {
+        throw new RuntimeException('Streamed result was truncated by the legacy server row setting.');
     }
     $client->query('USE foxydb');
     $readerHash = password_hash('reader-pass', PASSWORD_DEFAULT);
@@ -423,8 +418,7 @@ try {
         || !str_contains($generalLog, 'query.executed')
         || !str_contains($auditLog, 'authentication.succeeded')
         || !str_contains($auditLog, 'authentication.failed')
-        || !str_contains($auditLog, '"status":"failed"')
-        || !str_contains($auditLog, '"error_code":"RESOURCE_LIMIT"')) {
+        || !str_contains($auditLog, '"status":"failed"')) {
         throw new RuntimeException('TCP server did not emit the required structured log events.');
     }
     foreach (['wrong-password', 'reader-pass', $generatedRootPassword] as $secret) {

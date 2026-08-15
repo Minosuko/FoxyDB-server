@@ -24,14 +24,21 @@ final class BinaryMetadata
     private const LIST = 6;
     private const MAP = 7;
 
-    public static function encode(array $metadata): string
+    public static function encode(
+        array $metadata,
+        int $maximumBytes = self::MAXIMUM_BYTES,
+        int $maximumItems = self::MAXIMUM_ITEMS,
+    ): string
     {
-        $remainingItems = self::MAXIMUM_ITEMS;
-        $remainingBytes = self::MAXIMUM_BYTES;
-        $payload = self::encodeValue($metadata, 0, $remainingItems, $remainingBytes);
+        self::validateLimits($maximumBytes, $maximumItems);
+        $remainingItems = $maximumItems;
+        $remainingBytes = $maximumBytes;
+        $payload = self::encodeValue(
+            $metadata, 0, $remainingItems, $remainingBytes, $maximumBytes, $maximumItems,
+        );
         $length = strlen($payload);
-        if ($length > self::MAXIMUM_BYTES) {
-            throw new FoxyException('Binary metadata exceeds the 4 MiB limit.', 'RESOURCE_LIMIT');
+        if ($length > $maximumBytes) {
+            throw new FoxyException('Binary metadata exceeds its configured limit.', 'RESOURCE_LIMIT');
         }
         return self::MAGIC
             . pack('nnN', self::VERSION, 0, $length)
@@ -39,13 +46,18 @@ final class BinaryMetadata
             . $payload;
     }
 
-    public static function decode(string $binary): array
+    public static function decode(
+        string $binary,
+        int $maximumBytes = self::MAXIMUM_BYTES,
+        int $maximumItems = self::MAXIMUM_ITEMS,
+    ): array
     {
+        self::validateLimits($maximumBytes, $maximumItems);
         if (strlen($binary) < self::HEADER_BYTES || substr($binary, 0, 4) !== self::MAGIC) {
             throw new FoxyException('Invalid binary metadata header.', 'STORAGE_CORRUPT');
         }
-        $length = self::payloadLength(substr($binary, 0, self::HEADER_BYTES));
-        if ($length > self::MAXIMUM_BYTES || strlen($binary) !== self::HEADER_BYTES + $length) {
+        $length = self::payloadLength(substr($binary, 0, self::HEADER_BYTES), $maximumBytes);
+        if (strlen($binary) !== self::HEADER_BYTES + $length) {
             throw new FoxyException('Invalid binary metadata length.', 'STORAGE_CORRUPT');
         }
         $payload = substr($binary, self::HEADER_BYTES);
@@ -54,16 +66,17 @@ final class BinaryMetadata
         }
 
         $offset = 0;
-        $remainingItems = self::MAXIMUM_ITEMS;
-        $value = self::decodeValue($payload, $offset, 0, $remainingItems);
+        $remainingItems = $maximumItems;
+        $value = self::decodeValue($payload, $offset, 0, $remainingItems, $maximumBytes, $maximumItems);
         if (!is_array($value) || $offset !== $length) {
             throw new FoxyException('Invalid binary metadata root or trailing data.', 'STORAGE_CORRUPT');
         }
         return $value;
     }
 
-    public static function payloadLength(string $header): int
+    public static function payloadLength(string $header, int $maximumBytes = self::MAXIMUM_BYTES): int
     {
+        self::validateLimits($maximumBytes, 1);
         if (strlen($header) !== self::HEADER_BYTES || substr($header, 0, 4) !== self::MAGIC) {
             throw new FoxyException('Invalid binary metadata header.', 'STORAGE_CORRUPT');
         }
@@ -72,7 +85,7 @@ final class BinaryMetadata
             throw new FoxyException('Unsupported binary metadata version or flags.', 'STORAGE_CORRUPT');
         }
         $length = (int) $decoded['length'];
-        if ($length > self::MAXIMUM_BYTES) {
+        if ($length > $maximumBytes) {
             throw new FoxyException('Binary metadata exceeds its size limit.', 'STORAGE_CORRUPT');
         }
         return $length;
@@ -83,6 +96,8 @@ final class BinaryMetadata
         int $depth,
         int &$remainingItems,
         int &$remainingBytes,
+        int $maximumBytes,
+        int $maximumItems,
     ): string
     {
         self::checkDepth($depth);
@@ -112,7 +127,7 @@ final class BinaryMetadata
         }
         if (is_string($value)) {
             $length = strlen($value);
-            if ($length > self::MAXIMUM_BYTES) {
+            if ($length > $maximumBytes) {
                 throw new FoxyException('Binary metadata string is too large.', 'RESOURCE_LIMIT');
             }
             self::consumeBytes($remainingBytes, 5 + $length);
@@ -121,7 +136,7 @@ final class BinaryMetadata
         if (!is_array($value)) {
             throw new FoxyException('Binary metadata contains an unsupported value.', 'STORAGE_IO');
         }
-        if (count($value) > self::MAXIMUM_ITEMS) {
+        if (count($value) > $maximumItems) {
             throw new FoxyException('Binary metadata collection has too many items.', 'RESOURCE_LIMIT');
         }
         $remainingItems -= count($value);
@@ -133,7 +148,9 @@ final class BinaryMetadata
             self::consumeBytes($remainingBytes, 5);
             $encoded = chr(self::LIST) . BinaryCodec::uint32(count($value));
             foreach ($value as $item) {
-                $encoded .= self::encodeValue($item, $depth + 1, $remainingItems, $remainingBytes);
+                $encoded .= self::encodeValue(
+                    $item, $depth + 1, $remainingItems, $remainingBytes, $maximumBytes, $maximumItems,
+                );
             }
             return $encoded;
         }
@@ -145,17 +162,26 @@ final class BinaryMetadata
                 throw new FoxyException('Binary metadata map keys must be strings.', 'STORAGE_IO');
             }
             $keyLength = strlen($key);
-            if ($keyLength > self::MAXIMUM_BYTES) {
+            if ($keyLength > $maximumBytes) {
                 throw new FoxyException('Binary metadata map key is too large.', 'RESOURCE_LIMIT');
             }
             self::consumeBytes($remainingBytes, 4 + $keyLength);
             $encoded .= BinaryCodec::uint32($keyLength) . $key;
-            $encoded .= self::encodeValue($item, $depth + 1, $remainingItems, $remainingBytes);
+            $encoded .= self::encodeValue(
+                $item, $depth + 1, $remainingItems, $remainingBytes, $maximumBytes, $maximumItems,
+            );
         }
         return $encoded;
     }
 
-    private static function decodeValue(string $payload, int &$offset, int $depth, int &$remainingItems): mixed
+    private static function decodeValue(
+        string $payload,
+        int &$offset,
+        int $depth,
+        int &$remainingItems,
+        int $maximumBytes,
+        int $maximumItems,
+    ): mixed
     {
         self::checkDepth($depth);
         $type = ord(self::take($payload, $offset, 1));
@@ -165,9 +191,13 @@ final class BinaryMetadata
             self::TRUE => true,
             self::INTEGER => self::decodeInteger($payload, $offset),
             self::FLOAT => self::decodeFloat($payload, $offset),
-            self::STRING => self::decodeString($payload, $offset),
-            self::LIST => self::decodeList($payload, $offset, $depth + 1, $remainingItems),
-            self::MAP => self::decodeMap($payload, $offset, $depth + 1, $remainingItems),
+            self::STRING => self::decodeString($payload, $offset, $maximumBytes),
+            self::LIST => self::decodeList(
+                $payload, $offset, $depth + 1, $remainingItems, $maximumBytes, $maximumItems,
+            ),
+            self::MAP => self::decodeMap(
+                $payload, $offset, $depth + 1, $remainingItems, $maximumBytes, $maximumItems,
+            ),
             default => throw new FoxyException('Unknown binary metadata value type.', 'STORAGE_CORRUPT'),
         };
     }
@@ -199,28 +229,36 @@ final class BinaryMetadata
         return $value;
     }
 
-    private static function decodeString(string $payload, int &$offset): string
+    private static function decodeString(string $payload, int &$offset, int $maximumBytes): string
     {
-        $length = self::decodeLength($payload, $offset);
+        $length = self::decodeLength($payload, $offset, $maximumBytes);
         return self::take($payload, $offset, $length);
     }
 
-    private static function decodeList(string $payload, int &$offset, int $depth, int &$remainingItems): array
+    private static function decodeList(
+        string $payload, int &$offset, int $depth, int &$remainingItems,
+        int $maximumBytes, int $maximumItems,
+    ): array
     {
-        $count = self::decodeCount($payload, $offset, $remainingItems);
+        $count = self::decodeCount($payload, $offset, $remainingItems, $maximumItems);
         $list = [];
         for ($index = 0; $index < $count; $index++) {
-            $list[] = self::decodeValue($payload, $offset, $depth, $remainingItems);
+            $list[] = self::decodeValue(
+                $payload, $offset, $depth, $remainingItems, $maximumBytes, $maximumItems,
+            );
         }
         return $list;
     }
 
-    private static function decodeMap(string $payload, int &$offset, int $depth, int &$remainingItems): array
+    private static function decodeMap(
+        string $payload, int &$offset, int $depth, int &$remainingItems,
+        int $maximumBytes, int $maximumItems,
+    ): array
     {
-        $count = self::decodeCount($payload, $offset, $remainingItems);
+        $count = self::decodeCount($payload, $offset, $remainingItems, $maximumItems);
         $map = [];
         for ($index = 0; $index < $count; $index++) {
-            $keyLength = self::decodeLength($payload, $offset);
+            $keyLength = self::decodeLength($payload, $offset, $maximumBytes);
             $key = self::take($payload, $offset, $keyLength);
             $probe = [];
             $probe[$key] = true;
@@ -230,24 +268,28 @@ final class BinaryMetadata
             if (array_key_exists($key, $map)) {
                 throw new FoxyException('Binary metadata contains a duplicate map key.', 'STORAGE_CORRUPT');
             }
-            $map[$key] = self::decodeValue($payload, $offset, $depth, $remainingItems);
+            $map[$key] = self::decodeValue(
+                $payload, $offset, $depth, $remainingItems, $maximumBytes, $maximumItems,
+            );
         }
         return $map;
     }
 
-    private static function decodeLength(string $payload, int &$offset): int
+    private static function decodeLength(string $payload, int &$offset, int $maximumBytes): int
     {
         $length = BinaryCodec::readUint32(self::take($payload, $offset, 4));
-        if ($length > self::MAXIMUM_BYTES) {
+        if ($length > $maximumBytes) {
             throw new FoxyException('Binary metadata value exceeds its size limit.', 'STORAGE_CORRUPT');
         }
         return $length;
     }
 
-    private static function decodeCount(string $payload, int &$offset, int &$remainingItems): int
+    private static function decodeCount(
+        string $payload, int &$offset, int &$remainingItems, int $maximumItems,
+    ): int
     {
         $count = BinaryCodec::readUint32(self::take($payload, $offset, 4));
-        if ($count > self::MAXIMUM_ITEMS) {
+        if ($count > $maximumItems) {
             throw new FoxyException('Binary metadata collection exceeds its item limit.', 'STORAGE_CORRUPT');
         }
         $remainingItems -= $count;
@@ -278,7 +320,14 @@ final class BinaryMetadata
     {
         $remainingBytes -= $bytes;
         if ($remainingBytes < 0) {
-            throw new FoxyException('Binary metadata exceeds the 4 MiB limit.', 'RESOURCE_LIMIT');
+            throw new FoxyException('Binary metadata exceeds its configured limit.', 'RESOURCE_LIMIT');
+        }
+    }
+
+    private static function validateLimits(int $maximumBytes, int $maximumItems): void
+    {
+        if ($maximumBytes < 1 || $maximumItems < 1) {
+            throw new FoxyException('Binary metadata limits must be positive.', 'INVALID_CONFIG');
         }
     }
 }

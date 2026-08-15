@@ -9,10 +9,16 @@ $tests = [
     'sql_smoke.php',
     'regression.php',
     'authentication.php',
+    'identifiers.php',
+    'ordered_indexes.php',
     'system_variables.php',
     'logging.php',
     'secure_options.php',
     'tcp_smoke.php',
+    'concurrency_smoke.php',
+    'replication.php',
+    'ordered_indexes_disk.php',
+    'crash_consistency.php',
 ];
 
 foreach ($tests as $test) {

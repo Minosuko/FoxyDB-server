@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace FoxyDB;
 
 use FoxyDB\Exception\FoxyException;
+use FoxyDB\Protocol\FrameCodec;
 
 final readonly class Config
 {
@@ -16,7 +17,6 @@ final readonly class Config
         public int $chunkBytes = 1_048_576,
         public int $inlineValueBytes = 65_536,
         public int $maxMaterializedBytes = 67_108_864,
-        public int $maxRowsPerResult = 1_000_000,
         public int $idleTimeoutSeconds = 300,
         public bool $syncWrites = true,
         public int $maxConnections = 256,
@@ -34,27 +34,30 @@ final readonly class Config
         public ?string $slowQueryLogFile = null,
         public int $maxConcurrentQueries = 32,
         public int $maxQueuedQueriesPerClient = 8,
+        public bool $replicationEnabled = false,
+        public int $replicationRetentionHours = 24,
+        public bool $tlsEnabled = true,
     ) {
         if ($port < 1 || $port > 65_535) {
             throw new FoxyException('Port must be between 1 and 65535.', 'INVALID_CONFIG');
         }
-        if ($maxFrameBytes < 1_024 || $maxFrameBytes > 1_073_741_824
-            || $chunkBytes < 4_096 || $inlineValueBytes < 0) {
+        if ($maxFrameBytes < 1_024 || $maxFrameBytes > FrameCodec::MAXIMUM_FRAME_BYTES
+            || $chunkBytes < 1 || $inlineValueBytes < 0) {
             throw new FoxyException('Invalid frame or chunk size configuration.', 'INVALID_CONFIG');
         }
-        if ($chunkBytes > $maxFrameBytes / 2) {
-            throw new FoxyException('Chunk size must be at most half of the frame size.', 'INVALID_CONFIG');
-        }
-        if ($maxMaterializedBytes < 1_048_576 || $maxMaterializedBytes > 4_294_967_296
-            || $maxRowsPerResult < 1 || $idleTimeoutSeconds < 1 || $idleTimeoutSeconds > 31_536_000
+        if ($maxMaterializedBytes < 1 || $maxMaterializedBytes > PHP_INT_MAX
+            || $idleTimeoutSeconds < 1
             || $maxConnections < 1 || $maxTransfersPerClient < 1 || $maxGlobalTransfers < 1
             || $maxConcurrentQueries < 1 || $maxQueuedQueriesPerClient < 1
-            || $maxUploadBytes < 1 || $logMaxBytes < 1_024 || $logMaxFiles < 1 || $logMaxFiles > 100
+            || $maxUploadBytes < 1 || $logMaxBytes < 1_024 || $logMaxFiles < 1
             || $slowQueryMilliseconds < 0) {
             throw new FoxyException('Resource limits must be positive.', 'INVALID_CONFIG');
         }
         if ($socket !== null && $socket === '') {
             throw new FoxyException('Socket path must not be empty.', 'INVALID_CONFIG');
+        }
+        if ($replicationRetentionHours < 0) {
+            throw new FoxyException('Replication retention must not be negative.', 'INVALID_CONFIG');
         }
     }
 
@@ -72,7 +75,6 @@ final readonly class Config
             chunkBytes: self::envInt('FOXYDB_CHUNK_BYTES', 1_048_576),
             inlineValueBytes: self::envInt('FOXYDB_INLINE_VALUE_BYTES', 65_536),
             maxMaterializedBytes: self::envInt('FOXYDB_MAX_MATERIALIZED_BYTES', 67_108_864),
-            maxRowsPerResult: self::envInt('FOXYDB_MAX_RESULT_ROWS', 1_000_000),
             idleTimeoutSeconds: self::envInt('FOXYDB_IDLE_TIMEOUT', 300),
             syncWrites: self::envBool('FOXYDB_SYNC_WRITES', true),
             maxConnections: self::envInt('FOXYDB_MAX_CONNECTIONS', 256),
@@ -90,6 +92,9 @@ final readonly class Config
             slowQueryLogFile: self::env('FOXYDB_SLOW_QUERY_LOG_FILE') ?? $ini['slow_query_log_file'] ?? null,
             maxConcurrentQueries: self::envInt('FOXYDB_MAX_CONCURRENT_QUERIES', 32),
             maxQueuedQueriesPerClient: self::envInt('FOXYDB_MAX_QUEUED_QUERIES', 8),
+            replicationEnabled: self::envBool('FOXYDB_REPLICATION', false),
+            replicationRetentionHours: self::envInt('FOXYDB_REPLICATION_RETENTION_HOURS', 24),
+            tlsEnabled: self::envBool('FOXYDB_TLS', self::iniBool($ini['tls'] ?? null, true)),
         );
     }
 
@@ -103,7 +108,6 @@ final readonly class Config
             chunkBytes: (int) ($overrides['chunkBytes'] ?? $this->chunkBytes),
             inlineValueBytes: (int) ($overrides['inlineValueBytes'] ?? $this->inlineValueBytes),
             maxMaterializedBytes: (int) ($overrides['maxMaterializedBytes'] ?? $this->maxMaterializedBytes),
-            maxRowsPerResult: (int) ($overrides['maxRowsPerResult'] ?? $this->maxRowsPerResult),
             idleTimeoutSeconds: (int) ($overrides['idleTimeoutSeconds'] ?? $this->idleTimeoutSeconds),
             syncWrites: (bool) ($overrides['syncWrites'] ?? $this->syncWrites),
             maxConnections: (int) ($overrides['maxConnections'] ?? $this->maxConnections),
@@ -129,6 +133,9 @@ final readonly class Config
                 : $this->slowQueryLogFile,
             maxConcurrentQueries: (int) ($overrides['maxConcurrentQueries'] ?? $this->maxConcurrentQueries),
             maxQueuedQueriesPerClient: (int) ($overrides['maxQueuedQueriesPerClient'] ?? $this->maxQueuedQueriesPerClient),
+            replicationEnabled: (bool) ($overrides['replicationEnabled'] ?? $this->replicationEnabled),
+            replicationRetentionHours: (int) ($overrides['replicationRetentionHours'] ?? $this->replicationRetentionHours),
+            tlsEnabled: (bool) ($overrides['tlsEnabled'] ?? $this->tlsEnabled),
         );
     }
 

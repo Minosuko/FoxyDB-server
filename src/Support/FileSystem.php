@@ -110,7 +110,11 @@ final class FileSystem
         }
     }
 
-    public static function readMetadata(string $path): array
+    public static function readMetadata(
+        string $path,
+        int $maximumBytes = BinaryMetadata::MAXIMUM_BYTES,
+        int $maximumItems = 100_000,
+    ): array
     {
         $stream = @fopen($path, 'rb');
         if ($stream === false) {
@@ -119,24 +123,30 @@ final class FileSystem
         try {
             $statistics = fstat($stream);
             if ($statistics === false || $statistics['size'] < BinaryMetadata::HEADER_BYTES
-                || $statistics['size'] > BinaryMetadata::HEADER_BYTES + BinaryMetadata::MAXIMUM_BYTES) {
+                || $statistics['size'] > BinaryMetadata::HEADER_BYTES + $maximumBytes) {
                 throw new FoxyException('Binary metadata file has an invalid size.', 'STORAGE_CORRUPT');
             }
             $header = self::readExact($stream, BinaryMetadata::HEADER_BYTES) ?? '';
-            $payloadLength = BinaryMetadata::payloadLength($header);
+            $payloadLength = BinaryMetadata::payloadLength($header, $maximumBytes);
             if ($statistics['size'] !== BinaryMetadata::HEADER_BYTES + $payloadLength) {
                 throw new FoxyException('Binary metadata file length does not match its header.', 'STORAGE_CORRUPT');
             }
             $payload = self::readExact($stream, $payloadLength) ?? '';
-            return BinaryMetadata::decode($header . $payload);
+            return BinaryMetadata::decode($header . $payload, $maximumBytes, $maximumItems);
         } finally {
             fclose($stream);
         }
     }
 
-    public static function writeMetadata(string $path, array $value, bool $sync = true): void
+    public static function writeMetadata(
+        string $path,
+        array $value,
+        bool $sync = true,
+        int $maximumBytes = BinaryMetadata::MAXIMUM_BYTES,
+        int $maximumItems = 100_000,
+    ): void
     {
-        self::atomicWrite($path, BinaryMetadata::encode($value), $sync);
+        self::atomicWrite($path, BinaryMetadata::encode($value, $maximumBytes, $maximumItems), $sync);
     }
 
     public static function copyTree(string $source, string $target): void

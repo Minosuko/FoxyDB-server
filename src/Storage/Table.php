@@ -19,7 +19,7 @@ final class Table
     private const SLOT_DELETED = 2;
     private const RECORD_COMPRESSED = 1;
     private const JOURNAL_MAX_ENTRIES = 24_000;
-    private const JOURNAL_MAX_PARTS = 96;
+    private const JOURNAL_BATCH_FILE = 'row.batch.fdb';
     private const SLOT_CACHE_ENTRIES = 16_384;
 
     private readonly TypeSystem $types;
@@ -116,8 +116,11 @@ final class Table
         return $this->insertMany([$input])[0];
     }
 
-    public function insertMany(array $inputs, ?int $maximumStagingBytes = null): array
-    {
+    public function insertMany(
+        array $inputs,
+        ?int $maximumStagingBytes = null,
+        ?\Closure $rowCheck = null,
+    ): array {
         if ($inputs === []) {
             return [];
         }
@@ -139,6 +142,12 @@ final class Table
                     throw new FoxyException('Row sequence points to an allocated slot.', 'STORAGE_CORRUPT');
                 }
                 $row = $this->types->prepareInsert($input, $schema, $nextAuto);
+                if ($rowCheck !== null && !$rowCheck($row)) {
+                    throw new FoxyException(
+                        'The row violates a row-level policy.',
+                        'POLICY_VIOLATION',
+                    );
+                }
                 if ($autoColumn !== null) {
                     $autoValue = $row[$autoColumn];
                     if ($autoValue >= PHP_INT_MAX) {
@@ -215,14 +224,29 @@ final class Table
                     'unique' => $lookupIndex['unique'],
                     'primary' => $lookupIndex['primary'],
                 ];
-            if ($lookupValid) {
+            if ($lookup !== null && isset($lookup['range'])) {
+                $range = $lookup['range'];
+                $rangeIndex = $schema['indexes'][$range['name']] ?? null;
+                if ($rangeIndex === null || ($rangeIndex['ordered'] ?? false) !== true) {
+                    throw new FoxyException('Range lookup requires an ordered index.', 'SCHEMA_ERROR');
+                }
+                $store = $this->indexStore($schema);
+                $rowIds = $store->rangeLookup(
+                    $range['name'],
+                    $range['minimum'],
+                    $range['maximum'],
+                    $range['min_inclusive'],
+                    $range['max_inclusive'],
+                );
+                $prefetched = count($rowIds) <= 256 ? $this->readRowsLocked($schema, $rowIds) : null;
+            } elseif ($lookupValid) {
                 $store = $this->indexStore($schema);
                 $rowIds = $store->lookup($lookup['name'], $lookup['key']);
                 $maximum = null;
                 $prefetched = count($rowIds) <= 256 ? $this->readRowsLocked($schema, $rowIds) : null;
             } else {
-                $slotBytes = filesize($generation . DIRECTORY_SEPARATOR . 'rows.fdx');
-                if ($slotBytes === false || $slotBytes % self::SLOT_BYTES !== 0) {
+                $slotBytes = $this->fileSize($generation . DIRECTORY_SEPARATOR . 'rows.fdx');
+                if ($slotBytes % self::SLOT_BYTES !== 0) {
                     throw new FoxyException('Row slot file has a truncated tail.', 'STORAGE_CORRUPT');
                 }
                 $rowIds = null;
@@ -275,12 +299,8 @@ final class Table
                 throw new FoxyException('Unable to open row slots.', 'STORAGE_IO');
             }
             try {
-                $statistics = fstat($stream);
-                if ($statistics === false) {
-                    throw new FoxyException('Unable to inspect row slots.', 'STORAGE_IO');
-                }
-                $bytes = (int) ($statistics['size'] ?? -1);
-                if ($bytes < 0 || $bytes % self::SLOT_BYTES !== 0) {
+                $bytes = $this->streamSize($stream);
+                if ($bytes % self::SLOT_BYTES !== 0) {
                     throw new FoxyException('Row slot file has a truncated tail.', 'STORAGE_CORRUPT');
                 }
                 $count = 0;
@@ -316,7 +336,7 @@ final class Table
             $schema = $this->loadMetadata();
             $genPath = $this->generationPath($schema);
             $dataFile = $genPath . DIRECTORY_SEPARATOR . 'rows.fdb';
-            $dataLength = @filesize($dataFile) ?: 0;
+            $dataLength = $this->fileSize($dataFile);
             $indexLength = 0;
             $indexRoot = $genPath . DIRECTORY_SEPARATOR . 'indexes';
             if (is_dir($indexRoot)) {
@@ -325,7 +345,12 @@ final class Table
                 );
                 foreach ($iterator as $file) {
                     if ($file->isFile()) {
-                        $indexLength += $file->getSize();
+                        $fileBytes = $file->getSize();
+                        if (!is_int($fileBytes) || $fileBytes < 0
+                            || $indexLength > PHP_INT_MAX - $fileBytes) {
+                            throw new FoxyException('Index size exceeds this platform limit.', 'PLATFORM_LIMIT');
+                        }
+                        $indexLength += $fileBytes;
                     }
                 }
             }
@@ -386,34 +411,53 @@ final class Table
             $schema = $this->loadMetadata();
             $this->validateMetadata($schema);
             $slotPath = $this->generationPath($schema) . DIRECTORY_SEPARATOR . 'rows.fdx';
-            $slotBytes = @filesize($slotPath);
-            if ($slotBytes === false || $slotBytes % self::SLOT_BYTES !== 0) {
+            $slotBytes = $this->fileSize($slotPath);
+            if ($slotBytes % self::SLOT_BYTES !== 0) {
                 throw new FoxyException('Row slot file has an invalid length.', 'STORAGE_CORRUPT');
             }
             $stream = @fopen($slotPath, 'rb');
             if ($stream === false) {
                 throw new FoxyException('Unable to open row slot file.', 'STORAGE_IO');
             }
+            $data = @fopen($this->generationPath($schema) . DIRECTORY_SEPARATOR . 'rows.fdb', 'rb');
+            if ($data === false) {
+                fclose($stream);
+                throw new FoxyException('Unable to open row data file.', 'STORAGE_IO');
+            }
             $count = 0;
             $errors = [];
             $remaining = intdiv($slotBytes, self::SLOT_BYTES);
+            $rowId = 0;
             while ($remaining > 0) {
                 $slots = min(1_024, $remaining);
                 $block = FileSystem::readExact($stream, $slots * self::SLOT_BYTES) ?? '';
                 for ($i = 0; $i < $slots; $i++) {
+                    $rowId++;
                     $slot = substr($block, $i * self::SLOT_BYTES, self::SLOT_BYTES);
+                    if ($slot === str_repeat("\0", self::SLOT_BYTES)) {
+                        continue;
+                    }
                     try {
                         $decoded = $this->decodeSlotBytes($slot);
                         if ($decoded['status'] === self::SLOT_ACTIVE) {
+                            $record = $this->readRecord($data, $schema, $rowId, $decoded, true);
+                            $store = $this->indexStore($schema);
+                            foreach ($this->indexEntries($schema, $record['values']) as $name => $indexEntry) {
+                                if (!$indexEntry['skip']
+                                    && !in_array($rowId, $store->lookup($name, $indexEntry['key']), true)) {
+                                    throw new FoxyException("Index {$name} is missing row {$rowId}.", 'STORAGE_CORRUPT');
+                                }
+                            }
                             $count++;
                         }
                     } catch (\Throwable $e) {
-                        $errors[] = 'Slot ' . ($remaining - $remaining + $i) . ': ' . $e->getMessage();
+                        $errors[] = 'Slot ' . $rowId . ': ' . $e->getMessage();
                     }
                 }
                 $remaining -= $slots;
             }
             fclose($stream);
+            fclose($data);
             if ($errors !== []) {
                 return ['status' => 'corrupt', 'rows' => $count, 'errors' => $errors];
             }
@@ -433,6 +477,7 @@ final class Table
         ?callable $predicate = null,
         ?array $lookup = null,
         ?int $maximumStagingBytes = null,
+        ?\Closure $newRowCheck = null,
     ): int
     {
         $this->beginMutation();
@@ -448,14 +493,17 @@ final class Table
                     continue;
                 }
                 $newRow = $this->types->prepareUpdate($oldRow, $assignments, $schema);
+                if ($newRowCheck !== null && !$newRowCheck($newRow)) {
+                    throw new FoxyException(
+                        'The updated row violates a row-level policy.',
+                        'POLICY_VIOLATION',
+                    );
+                }
                 $this->indexEntries($schema, $newRow);
                 $changes[] = ['id' => $entry['id'], 'old' => $oldRow, 'new' => $newRow];
                 $stagedBytes += 64 + MemoryCache::estimateBytes($oldRow) + MemoryCache::estimateBytes($newRow);
                 if ($maximumStagingBytes !== null && $stagedBytes > $maximumStagingBytes) {
                     throw new FoxyException('UPDATE exceeded the configured heap staging limit.', 'RESOURCE_LIMIT');
-                }
-                if (count($changes) > $this->config->maxRowsPerResult) {
-                    throw new FoxyException('UPDATE exceeded the configured mutation row limit.', 'RESOURCE_LIMIT');
                 }
             }
             $this->assertBatchUpdateUniqueLocked(
@@ -529,9 +577,6 @@ final class Table
                 if ($maximumStagingBytes !== null && $stagedBytes > $maximumStagingBytes) {
                     throw new FoxyException('DELETE exceeded the configured heap staging limit.', 'RESOURCE_LIMIT');
                 }
-                if (count($deletions) > $this->config->maxRowsPerResult) {
-                    throw new FoxyException('DELETE exceeded the configured mutation row limit.', 'RESOURCE_LIMIT');
-                }
             }
             $batchChanges = [];
             foreach ($deletions as $entry) {
@@ -554,6 +599,7 @@ final class Table
         if ($entries === []) {
             return;
         }
+        $this->beginMutation();
         $lock = $this->acquireLock(LOCK_EX);
         try {
             $this->recoverLocked();
@@ -572,14 +618,20 @@ final class Table
                 }
             }
             $this->rebuildIndexesLocked($schema);
+            $this->notifyMutation();
             $this->finishMutationLocked();
         } finally {
             $this->releaseLock($lock);
         }
     }
 
-    public function createIndex(string $name, array $columns, bool $unique, bool $ifNotExists = false): void
-    {
+    public function createIndex(
+        string $name,
+        array $columns,
+        bool $unique,
+        bool $ifNotExists = false,
+        bool $ordered = false,
+    ): void {
         $this->beginMutation();
         $name = TypeSystem::identifier($name);
         $columns = array_map([TypeSystem::class, 'identifier'], $columns);
@@ -614,6 +666,7 @@ final class Table
                 'columns' => $columns,
                 'unique' => $unique,
                 'primary' => false,
+                'ordered' => $ordered,
             ];
             $this->types->validateIndex($index, $schema);
             $generation = $this->generationPath($schema);
@@ -627,7 +680,7 @@ final class Table
                     if ($unique && IndexStore::containsNull($values)) {
                         continue;
                     }
-                    $store->append($name, IndexStore::key($values), $entry['id'], true);
+                    $store->append($name, $this->encodeIndexKey($index, $values), $entry['id'], true);
                 }
                 if ($unique) {
                     $store->assertUnique($name);
@@ -882,6 +935,8 @@ final class Table
                         'columns' => $columns,
                         'unique' => $unique,
                         'primary' => $kind === 'add_primary',
+                        'ordered' => (bool) ($action['ordered'] ?? false),
+                        'ordered_codec' => (bool) ($action['ordered'] ?? false) ? 2 : null,
                     ];
                     $this->types->validateIndex($index, $newSchema);
                     $newSchema['indexes'][$name] = $index;
@@ -903,7 +958,7 @@ final class Table
                         if ($unique && IndexStore::containsNull($values)) {
                             continue;
                         }
-                        $store->append($name, IndexStore::key($values), $entry['id'], true);
+                        $store->append($name, $this->encodeIndexKey($index, $values), $entry['id'], true);
                     }
                     if ($unique) {
                         $store->assertUnique($name);
@@ -963,9 +1018,6 @@ final class Table
                     $col = $action['column'];
                     $col['name'] = TypeSystem::identifier($col['name']);
                     $this->validateColumnExists($schema, $col['name']);
-                    if (count($newSchema['columns']) > 1024) {
-                        throw new FoxyException('The table already has the maximum number of columns.', 'SCHEMA_ERROR');
-                    }
                     $this->types->compileColumn($col, $newSchema);
                     if ($newSchema['auto_increment_column'] === $col['name']
                         && !($col['auto_increment'] ?? false)) {
@@ -1131,7 +1183,9 @@ final class Table
             if ($best === null || count($index['columns']) > $best['columns']) {
                 $best = [
                     'name' => $index['name'],
-                    'key' => IndexStore::key($indexValues),
+                    'key' => ($index['ordered'] ?? false)
+                        ? IndexStore::orderedKey($indexValues)
+                        : IndexStore::key($indexValues),
                     'columns' => count($index['columns']),
                     'signature' => [
                         'columns' => $index['columns'],
@@ -1168,12 +1222,26 @@ final class Table
         }
         $rebuildIndexes = false;
         $journalPaths = [];
-        for ($part = 0; $part < self::JOURNAL_MAX_PARTS; $part++) {
-            $path = $this->journalPath($part);
-            if (!is_file($path)) {
-                break;
+        $journalParts = [];
+        $directoryEntries = scandir($this->path);
+        if ($directoryEntries === false) {
+            throw new FoxyException('Unable to inspect row journals.', 'STORAGE_IO');
+        }
+        foreach ($directoryEntries as $entry) {
+            if ($entry === 'row.journal.fdb') {
+                $journalParts[] = 0;
+            } elseif (preg_match('/^row\.journal\.(\d+)\.fdb$/', $entry, $match) === 1) {
+                $journalParts[] = (int) $match[1];
             }
-            $journalPaths[] = $path;
+        }
+        sort($journalParts, SORT_NUMERIC);
+        foreach ($journalParts as $position => $part) {
+            if ($part !== $position) {
+                throw new FoxyException('Row journal parts are missing or exceed recovery capacity.', 'STORAGE_CORRUPT');
+            }
+        }
+        foreach ($journalParts as $part) {
+            $journalPaths[] = $this->journalPath($part);
         }
         foreach ($journalPaths as $journalPath) {
             $journal = FileSystem::readMetadata($journalPath);
@@ -1201,14 +1269,15 @@ final class Table
             if ($generation !== (int) $schema['active_generation']) {
                 throw new FoxyException('Invalid row journal generation.', 'STORAGE_CORRUPT');
             }
-            $slotBytes = filesize($this->generationPath($schema) . DIRECTORY_SEPARATOR . 'rows.fdx');
-            if ($slotBytes === false || $slotBytes % self::SLOT_BYTES !== 0) {
+            $slotBytes = $this->fileSize($this->generationPath($schema) . DIRECTORY_SEPARATOR . 'rows.fdx');
+            if ($slotBytes % self::SLOT_BYTES !== 0) {
                 throw new FoxyException('Row slot file has an invalid length.', 'STORAGE_CORRUPT');
             }
             $allocatedRows = intdiv($slotBytes, self::SLOT_BYTES);
-            $maximumAllowed = $allocatedRows > PHP_INT_MAX - $this->config->maxRowsPerResult - 1
+            $entryCount = count($entries);
+            $maximumAllowed = $allocatedRows > PHP_INT_MAX - $entryCount
                 ? PHP_INT_MAX
-                : $allocatedRows + $this->config->maxRowsPerResult + 1;
+                : $allocatedRows + $entryCount;
             foreach ($entries as $entry) {
                 $rowId = $entry['row_id'] ?? null;
                 $slot = $entry['slot'] ?? null;
@@ -1244,12 +1313,112 @@ final class Table
                 throw new FoxyException('Unable to clear row journal.', 'STORAGE_IO');
             }
         }
-        if (is_file($this->dirtyPath()) || $rebuildIndexes || !$this->indexesComplete($schema)) {
+        $batchPath = $this->batchIntentPath();
+        if (is_file($batchPath)) {
+            $this->recoverBatchLocked($schema, $batchPath, $missingGeneration, $rebuildIndexes);
+        }
+        $upgradeOrderedCodec = false;
+        foreach ($schema['indexes'] as &$index) {
+            if (($index['ordered'] ?? false) && ($index['ordered_codec'] ?? 1) < 2) {
+                $index['ordered_codec'] = 2;
+                $upgradeOrderedCodec = true;
+            }
+        }
+        unset($index);
+        if (is_file($this->dirtyPath()) || $rebuildIndexes || $upgradeOrderedCodec
+            || !$this->indexesComplete($schema)) {
             $this->rebuildIndexesLocked($schema);
+            if ($upgradeOrderedCodec) {
+                $this->storeMetadata($schema);
+            }
             if (is_file($this->dirtyPath()) && !@unlink($this->dirtyPath())) {
                 throw new FoxyException('Unable to clear dirty marker.', 'STORAGE_IO');
             }
         }
+    }
+
+    /**
+     * Resolves an interrupted batch commit.
+     *
+     * The batch journal discloses every promised post-batch slot. If all
+     * promises are already in place the batch committed fully and is kept;
+     * otherwise the batch never reached its commit point and every row of the
+     * batch is rolled back to its pre-batch slot, so a crash never leaves a
+     * committed prefix of a multi-row mutation.
+     *
+     * @param array $schema Validated table metadata.
+     * @param string $batchPath Path of the batch journal file.
+     */
+    private function recoverBatchLocked(array $schema, string $batchPath, ?int $missingGeneration, bool &$rebuildIndexes): void
+    {
+        $journal = FileSystem::readMetadata(
+            $batchPath, $this->config->maxMaterializedBytes, PHP_INT_MAX,
+        );
+        $generation = $journal['generation'] ?? null;
+        $changes = $journal['changes'] ?? null;
+        if (($journal['kind'] ?? null) !== 'batch' || !is_int($generation)
+            || !is_array($changes) || !array_is_list($changes) || $changes === []) {
+            throw new FoxyException('Invalid batch journal.', 'STORAGE_CORRUPT');
+        }
+        if ($missingGeneration !== null && $generation === $missingGeneration) {
+            if (!@unlink($batchPath)) {
+                throw new FoxyException('Unable to discard unavailable generation batch journal.', 'STORAGE_IO');
+            }
+            $rebuildIndexes = true;
+            return;
+        }
+        if ($generation !== (int) $schema['active_generation']) {
+            throw new FoxyException('Invalid batch journal generation.', 'STORAGE_CORRUPT');
+        }
+        $slotBytes = $this->fileSize($this->generationPath($schema) . DIRECTORY_SEPARATOR . 'rows.fdx');
+        if ($slotBytes % self::SLOT_BYTES !== 0) {
+            throw new FoxyException('Row slot file has an invalid length.', 'STORAGE_CORRUPT');
+        }
+        $allocatedRows = intdiv($slotBytes, self::SLOT_BYTES);
+        $changeCount = count($changes);
+        $maximumAllowed = $allocatedRows > PHP_INT_MAX - $changeCount
+            ? PHP_INT_MAX
+            : $allocatedRows + $changeCount;
+        $complete = true;
+        foreach ($changes as $entry) {
+            $rowId = $entry['row_id'] ?? null;
+            $newSlot = $entry['new_slot'] ?? null;
+            $oldSlot = $entry['old_slot'] ?? null;
+            if (!is_int($rowId) || $rowId < 1
+                || !is_string($newSlot) || strlen($newSlot) !== self::SLOT_BYTES
+                || ($oldSlot !== null && (!is_string($oldSlot) || strlen($oldSlot) !== self::SLOT_BYTES))) {
+                throw new FoxyException('Invalid batch journal.', 'STORAGE_CORRUPT');
+            }
+            $promised = $this->decodeSlotBytes($newSlot);
+            if (($promised['status'] === self::SLOT_DELETED && ($rowId > $allocatedRows))
+                || ($promised['status'] === self::SLOT_ACTIVE && $rowId > $maximumAllowed)) {
+                throw new FoxyException('Batch journal identifier exceeds its recovery bounds.', 'STORAGE_CORRUPT');
+            }
+            if ($this->readRawSlotBytesLocked($schema, $rowId) !== $newSlot) {
+                $complete = false;
+            }
+        }
+        if (!$complete) {
+            [,$slotStream] = $this->generationStreams($schema);
+            $streamBytes = $this->streamSize($slotStream);
+            foreach ($changes as $entry) {
+                $rowId = $entry['row_id'];
+                $oldSlot = $entry['old_slot'];
+                $position = $this->slotOffset($rowId);
+                if ($oldSlot !== null) {
+                    $this->writeSlotToStream($slotStream, $rowId, $oldSlot);
+                } elseif ($position < $streamBytes) {
+                    $this->writeSlotToStream($slotStream, $rowId, str_repeat("\0", self::SLOT_BYTES));
+                }
+                unset($this->slotCache[$generation . ':' . $rowId]);
+            }
+            FileSystem::flush($slotStream, $this->config->syncWrites);
+            $rebuildIndexes = true;
+        }
+        if (!@unlink($batchPath)) {
+            throw new FoxyException('Unable to clear batch journal.', 'STORAGE_IO');
+        }
+        $rebuildIndexes = true;
     }
 
     private function commitRowsLocked(array $schema, array $changes): void
@@ -1274,12 +1443,50 @@ final class Table
         $journalPart = 0;
         $committedRows = 0;
         $generation = (int) $schema['active_generation'];
+
+        // Disclose the whole batch before touching a single slot: each row is
+        // paired with its pre-batch slot bytes and the slot bytes the batch
+        // promises. Recovery compares promises against reality and either
+        // keeps every row of the batch or rolls every row back.
+        $intent = [];
+        if (fseek($dataStream, 0, SEEK_END) !== 0) {
+            throw new FoxyException('Unable to seek row data.', 'STORAGE_IO');
+        }
+        $nextOffset = ftell($dataStream);
+        if ($nextOffset === false) {
+            throw new FoxyException('Unable to determine row data offset.', 'STORAGE_IO');
+        }
+        foreach ($changes as $change) {
+            $record = $change['record'] ?? null;
+            $oldSlot = $this->readRawSlotBytesLocked($schema, $change['row_id']);
+            $oldGeneration = $oldSlot === null ? 0 : $this->decodeSlotBytes($oldSlot)['generation'];
+            $length = $record === null ? 0 : strlen($record);
+            $intent[] = [
+                'row_id' => $change['row_id'],
+                'old_slot' => $oldSlot,
+                'new_slot' => $this->encodeSlot(
+                    $record === null ? 0 : $nextOffset,
+                    $length,
+                    $oldGeneration + 1,
+                    $record === null ? self::SLOT_DELETED : self::SLOT_ACTIVE,
+                ),
+            ];
+            $nextOffset += $length;
+        }
+        $maximumIntentItems = count($intent) > intdiv(PHP_INT_MAX - 16, 4)
+            ? PHP_INT_MAX
+            : max(100_000, count($intent) * 4 + 16);
+        FileSystem::writeMetadata(
+            $this->batchIntentPath(),
+            ['kind' => 'batch', 'generation' => $generation, 'changes' => $intent],
+            $this->config->syncWrites,
+            $this->config->maxMaterializedBytes,
+            $maximumIntentItems,
+        );
         try {
-            foreach ($changes as $change) {
+            foreach ($changes as $index => $change) {
                 $rowId = $change['row_id'];
                 $record = $change['record'] ?? null;
-                $offset = 0;
-                $length = 0;
                 if ($record !== null) {
                     if (fseek($dataStream, 0, SEEK_END) !== 0) {
                         throw new FoxyException('Unable to seek row data.', 'STORAGE_IO');
@@ -1289,16 +1496,8 @@ final class Table
                         throw new FoxyException('Unable to determine row data offset.', 'STORAGE_IO');
                     }
                     FileSystem::writeAll($dataStream, $record);
-                    $length = strlen($record);
                 }
-                $currentSlot = $this->readSlotFromStream($slotStream, $rowId);
-                $slotGeneration = ($currentSlot['generation'] ?? 0) + 1;
-                $slot = $this->encodeSlot(
-                    $offset,
-                    $length,
-                    $slotGeneration,
-                    $record === null ? self::SLOT_DELETED : self::SLOT_ACTIVE,
-                );
+                $slot = $intent[$index]['new_slot'];
                 $journalEntries[] = ['row_id' => $rowId, 'slot' => $slot];
                 $this->writeSlotToStream($slotStream, $rowId, $slot);
                 unset($this->slotCache[$generation . ':' . $rowId]);
@@ -1312,6 +1511,9 @@ final class Table
                 $this->sealJournalGroupLocked($schema, $journalEntries, $dataStream, $slotStream, $journalPart++);
                 $committedRows += count($journalEntries);
                 $journalEntries = [];
+            }
+            if (!@unlink($this->batchIntentPath())) {
+                throw new FoxyException('Unable to clear batch journal.', 'STORAGE_IO');
             }
             $store = $this->indexStore($schema);
             foreach ($changes as $change) {
@@ -1471,11 +1673,18 @@ final class Table
             $values = $this->indexValues($index, $row);
             $skip = $index['unique'] && IndexStore::containsNull($values);
             $entries[$name] = [
-                'key' => $skip ? '' : IndexStore::key($values),
+                'key' => $skip ? '' : $this->encodeIndexKey($index, $values),
                 'skip' => $skip,
             ];
         }
         return $entries;
+    }
+
+    private function encodeIndexKey(array $index, array $values): string
+    {
+        return ($index['ordered'] ?? false)
+            ? IndexStore::orderedKey($values)
+            : IndexStore::key($values);
     }
 
     private function indexValues(array $index, array $row): array
@@ -1490,11 +1699,10 @@ final class Table
     private function iterateRowsLocked(array $schema, ?array $lookup, bool $includeRecord = false): \Generator
     {
         [$dataStream, $slotStream] = $this->generationStreams($schema);
-        $statistics = fstat($slotStream);
-        if ($statistics === false || ((int) $statistics['size']) % self::SLOT_BYTES !== 0) {
+        $slotBytes = $this->streamSize($slotStream);
+        if ($slotBytes % self::SLOT_BYTES !== 0) {
             throw new FoxyException('Row slot file has a truncated tail.', 'STORAGE_CORRUPT');
         }
-        $slotBytes = (int) $statistics['size'];
         $lookupIndex = $lookup === null ? null : ($schema['indexes'][$lookup['name']] ?? null);
             $lookupValid = $lookupIndex !== null
                 && ($lookup['signature'] ?? null) === [
@@ -1562,12 +1770,12 @@ final class Table
                 $flags |= self::RECORD_COMPRESSED;
             }
         }
-        if (strlen($stored) > 0xffffffff - self::DATA_HEADER_BYTES || strlen($raw) > 0xffffffff) {
+        if (strlen($stored) > PHP_INT_MAX - self::DATA_HEADER_BYTES) {
             throw new FoxyException('Row record exceeds the storage limit.', 'RESOURCE_LIMIT');
         }
         return 'FXR1' . BinaryCodec::uint64($rowId) . BinaryCodec::uint32($flags)
             . BinaryCodec::uint32(strlen($stored)) . BinaryCodec::uint32(strlen($raw))
-            . BinaryCodec::uint32(BinaryCodec::crc32($raw)) . $stored;
+            . BinaryCodec::crc32($raw) . $stored;
     }
 
     private function readRecord($stream, array $schema, int $rowId, array $slot, bool $includeRecord): array
@@ -1590,7 +1798,7 @@ final class Table
         $flags = BinaryCodec::readUint32($header, 12);
         $storedLength = BinaryCodec::readUint32($header, 16);
         $rawLength = BinaryCodec::readUint32($header, 20);
-        $checksum = BinaryCodec::readUint32($header, 24);
+        $checksum = substr($header, 24, 4);
         if ($slot['length'] !== self::DATA_HEADER_BYTES + $storedLength) {
             throw new FoxyException('Row slot length does not match its record.', 'STORAGE_CORRUPT');
         }
@@ -1603,7 +1811,7 @@ final class Table
         } else {
             $raw = $stored;
         }
-        if (strlen($raw) !== $rawLength || BinaryCodec::crc32($raw) !== $checksum) {
+        if (strlen($raw) !== $rawLength || !hash_equals($checksum, BinaryCodec::crc32($raw))) {
             throw new FoxyException('Row record checksum mismatch.', 'STORAGE_CORRUPT');
         }
         try {
@@ -1668,9 +1876,8 @@ final class Table
     private function readRawSlotBytesLocked(array $schema, int $rowId): ?string
     {
         [,$slotStream] = $this->generationStreams($schema);
-        $statistics = fstat($slotStream);
-        $streamBytes = (int) ($statistics['size'] ?? 0);
-        $offset = ($rowId - 1) * self::SLOT_BYTES;
+        $streamBytes = $this->streamSize($slotStream);
+        $offset = $this->slotOffset($rowId);
         if ($offset < 0 || $offset + self::SLOT_BYTES > $streamBytes) {
             return null;
         }
@@ -1703,11 +1910,11 @@ final class Table
         [$dataStream, $slotStream] = $this->generationStreams($schema);
         $rows = [];
         $decodedBytes = 0;
-        $statistics = fstat($slotStream);
-        if ($statistics === false || ((int) $statistics['size']) % self::SLOT_BYTES !== 0) {
+        $streamBytes = $this->streamSize($slotStream);
+        if ($streamBytes % self::SLOT_BYTES !== 0) {
             throw new FoxyException('Row slot file has a truncated tail.', 'STORAGE_CORRUPT');
         }
-        $slots = $this->readSlotsFromStream($slotStream, $rowIds, (int) $statistics['size']);
+        $slots = $this->readSlotsFromStream($slotStream, $rowIds, $streamBytes);
         foreach ($rowIds as $rowId) {
             $slot = $slots[$rowId] ?? null;
             if ($slot === null || $slot['status'] !== self::SLOT_ACTIVE) {
@@ -1726,10 +1933,9 @@ final class Table
 
     private function readSlotFromStream($stream, int $rowId, ?int $streamBytes = null): ?array
     {
-        $offset = ($rowId - 1) * self::SLOT_BYTES;
+        $offset = $this->slotOffset($rowId);
         if ($streamBytes === null) {
-            $statistics = fstat($stream);
-            $streamBytes = (int) ($statistics['size'] ?? 0);
+            $streamBytes = $this->streamSize($stream);
         }
         if ($offset < 0 || $offset + self::SLOT_BYTES > $streamBytes) {
             return null;
@@ -1768,7 +1974,7 @@ final class Table
         }
 
         $first = $rowIds[0];
-        $offset = ($first - 1) * self::SLOT_BYTES;
+        $offset = $this->slotOffset($first);
         $bytes = count($rowIds) * self::SLOT_BYTES;
         if ($offset < 0 || $offset + $bytes > $streamBytes) {
             return [];
@@ -1791,7 +1997,7 @@ final class Table
     {
         $body = BinaryCodec::uint64($offset) . BinaryCodec::uint32($length)
             . BinaryCodec::uint32($generation) . chr($status) . "\0\0\0";
-        return $body . BinaryCodec::uint32(BinaryCodec::crc32($body));
+        return $body . BinaryCodec::crc32($body);
     }
 
     private function writeSlotLocked(array $schema, int $rowId, string $slot): void
@@ -1811,7 +2017,7 @@ final class Table
 
     private function writeSlotToStream($stream, int $rowId, string $slot): void
     {
-        if (fseek($stream, ($rowId - 1) * self::SLOT_BYTES) !== 0) {
+        if (fseek($stream, $this->slotOffset($rowId)) !== 0) {
             throw new FoxyException('Unable to seek row slot.', 'STORAGE_IO');
         }
         FileSystem::writeAll($stream, $slot);
@@ -1834,6 +2040,33 @@ final class Table
             unset($this->indexStores[array_key_first($this->indexStores)]);
         }
         return $store;
+    }
+
+    private function slotOffset(int $rowId): int
+    {
+        if ($rowId < 1 || $rowId - 1 > intdiv(PHP_INT_MAX, self::SLOT_BYTES)) {
+            throw new FoxyException('Row id exceeds this platform file-offset limit.', 'PLATFORM_LIMIT');
+        }
+        return ($rowId - 1) * self::SLOT_BYTES;
+    }
+
+    private function fileSize(string $path): int
+    {
+        $size = @filesize($path);
+        if (!is_int($size) || $size < 0) {
+            throw new FoxyException('File size exceeds this platform limit.', 'PLATFORM_LIMIT');
+        }
+        return $size;
+    }
+
+    private function streamSize($stream): int
+    {
+        $statistics = fstat($stream);
+        $size = $statistics['size'] ?? null;
+        if (!is_int($size) || $size < 0) {
+            throw new FoxyException('File size exceeds this platform limit.', 'PLATFORM_LIMIT');
+        }
+        return $size;
     }
 
     private function loadMetadata(bool $refresh = false, bool $requireGeneration = true): array
@@ -1863,14 +2096,14 @@ final class Table
         $path = $this->sequencePath();
         $contents = @file_get_contents($path);
         $slotPath = $this->generationPath($schema) . DIRECTORY_SEPARATOR . 'rows.fdx';
-        $slotBytes = filesize($slotPath);
-        if ($slotBytes === false || $slotBytes % self::SLOT_BYTES !== 0) {
+        $slotBytes = $this->fileSize($slotPath);
+        if ($slotBytes % self::SLOT_BYTES !== 0) {
             throw new FoxyException('Row slot file has an invalid length.', 'STORAGE_CORRUPT');
         }
         $allocatedRows = intdiv($slotBytes, self::SLOT_BYTES);
         if ($contents !== false && strlen($contents) === 32 && substr($contents, 0, 4) === 'FXSQ'
             && BinaryCodec::readUint32($contents, 4) === 1
-            && BinaryCodec::crc32(substr($contents, 0, 24)) === BinaryCodec::readUint32($contents, 24)) {
+            && hash_equals(substr($contents, 24, 4), BinaryCodec::crc32(substr($contents, 0, 24)))) {
             $nextRow = BinaryCodec::readUint64($contents, 8);
             $nextAuto = BinaryCodec::readUint64($contents, 16);
             if ($nextRow > $allocatedRows && $nextAuto > 0) {
@@ -1898,7 +2131,7 @@ final class Table
     private static function writeSequenceFile(string $path, int $nextRow, int $nextAuto, bool $sync): void
     {
         $body = 'FXSQ' . BinaryCodec::uint32(1) . BinaryCodec::uint64($nextRow) . BinaryCodec::uint64($nextAuto);
-        FileSystem::atomicWrite($path, $body . BinaryCodec::uint32(BinaryCodec::crc32($body)) . "\0\0\0\0", $sync);
+        FileSystem::atomicWrite($path, $body . BinaryCodec::crc32($body) . "\0\0\0\0", $sync);
     }
 
     private static function initializeGeneration(string $path, array $indexNames, Config $config): void
@@ -1916,7 +2149,6 @@ final class Table
 
     private function acquireLock(int $operation)
     {
-        $retries = 0;
         while (true) {
             $stream = @fopen($this->lockPath, 'c+b');
             if ($stream === false) {
@@ -1928,17 +2160,9 @@ final class Table
             fclose($stream);
             if (!class_exists(\Fiber::class) || \Fiber::getCurrent() === null) {
                 usleep(1_000);
-                $retries++;
-                if ($retries > 5_000) {
-                    throw new FoxyException('Unable to acquire table lock.', 'STORAGE_LOCK');
-                }
                 continue;
             }
             \FoxyDB\Server::fiberYield(1_000);
-            $retries++;
-            if ($retries > 10_000) {
-                throw new FoxyException('Unable to acquire table lock.', 'STORAGE_LOCK');
-            }
         }
     }
 
@@ -1975,9 +2199,15 @@ final class Table
             throw new FoxyException('Unable to scan table directory.', 'STORAGE_IO');
         }
         foreach ($entries as $entry) {
-            if (preg_match('/^g(\d{6})$/', $entry, $match) === 1) {
-                $maximum = max($maximum, (int) $match[1]);
+            if (preg_match('/^g(\d+)$/', $entry, $match) === 1) {
+                $generation = (int) $match[1];
+                if ($generation > 0 && self::generationName($generation) === $entry) {
+                    $maximum = max($maximum, $generation);
+                }
             }
+        }
+        if ($maximum >= PHP_INT_MAX) {
+            throw new FoxyException('Table generation exceeds this platform.', 'PLATFORM_LIMIT');
         }
         return $maximum + 1;
     }
@@ -2003,6 +2233,11 @@ final class Table
     private function dirtyPath(): string
     {
         return $this->path . DIRECTORY_SEPARATOR . 'dirty';
+    }
+
+    private function batchIntentPath(): string
+    {
+        return $this->path . DIRECTORY_SEPARATOR . self::JOURNAL_BATCH_FILE;
     }
 
     private function generationPath(array $schema): string
@@ -2065,15 +2300,22 @@ final class Table
         $invalid = static function (): never {
             throw new FoxyException('Unsupported or invalid table metadata.', 'STORAGE_CORRUPT');
         };
+        $canonicalName = static function (string $name): bool {
+            try {
+                return TypeSystem::identifier($name) === $name;
+            } catch (FoxyException) {
+                return false;
+            }
+        };
         if (($metadata['format'] ?? null) !== 1
             || !is_string($metadata['table_id'] ?? null)
             || preg_match('/^[a-f0-9]{32}$/', $metadata['table_id']) !== 1
             || !is_string($metadata['name'] ?? null)
-            || preg_match('/^[a-z_][a-z0-9_]{0,63}$/', $metadata['name']) !== 1
+            || !$canonicalName($metadata['name'])
             || !is_int($metadata['active_generation'] ?? null)
-            || $metadata['active_generation'] < 1 || $metadata['active_generation'] > 999_999
+            || $metadata['active_generation'] < 1
             || !is_array($metadata['columns'] ?? null) || !array_is_list($metadata['columns'])
-            || $metadata['columns'] === [] || count($metadata['columns']) > 1_024
+            || $metadata['columns'] === []
             || !is_array($metadata['indexes'] ?? null)
             || !is_array($metadata['primary_key'] ?? null) || !array_is_list($metadata['primary_key'])
             || !array_key_exists('auto_increment_column', $metadata)
@@ -2081,7 +2323,7 @@ final class Table
             $invalid();
         }
         $previous = $metadata['previous_generation'];
-        if ($previous !== null && (!is_int($previous) || $previous < 1 || $previous > 999_999
+        if ($previous !== null && (!is_int($previous) || $previous < 1
             || $previous === $metadata['active_generation'])) {
             $invalid();
         }
@@ -2094,7 +2336,7 @@ final class Table
         foreach ($metadata['columns'] as $column) {
             if (!is_array($column)
                 || !is_string($column['name'] ?? null)
-                || preg_match('/^[a-z_][a-z0-9_]{0,63}$/', $column['name']) !== 1
+                || !$canonicalName($column['name'])
                 || isset($columnNames[$column['name']])
                 || !is_string($column['type'] ?? null) || !in_array($column['type'], $types, true)
                 || !array_key_exists('length', $column)
@@ -2132,7 +2374,7 @@ final class Table
             $invalid();
         }
         foreach ($metadata['indexes'] as $indexName => $index) {
-            if (!is_string($indexName) || preg_match('/^[a-z_][a-z0-9_]{0,63}$/', $indexName) !== 1
+            if (!is_string($indexName) || !$canonicalName($indexName)
                 || !is_array($index) || ($index['name'] ?? null) !== $indexName
                 || !is_array($index['columns'] ?? null) || !array_is_list($index['columns'])
                 || $index['columns'] === [] || !is_bool($index['unique'] ?? null)
@@ -2150,7 +2392,7 @@ final class Table
     private function decodeSlotBytes(string $slot): array
     {
         if (strlen($slot) !== self::SLOT_BYTES
-            || BinaryCodec::crc32(substr($slot, 0, 20)) !== BinaryCodec::readUint32($slot, 20)) {
+            || !hash_equals(substr($slot, 20, 4), BinaryCodec::crc32(substr($slot, 0, 20)))) {
             throw new FoxyException('Row slot checksum mismatch.', 'STORAGE_CORRUPT');
         }
         $status = ord($slot[16]);
@@ -2223,12 +2465,14 @@ final class Table
         $constraints = [];
         foreach ($schema['indexes'] ?? [] as $index) {
             if ($index['primary']) {
-                $constraints[] = ['kind' => 'primary', 'name' => 'primary', 'columns' => $index['columns']];
+                $constraint = ['kind' => 'primary', 'name' => 'primary', 'columns' => $index['columns']];
             } elseif ($index['unique']) {
-                $constraints[] = ['kind' => 'unique', 'name' => $index['name'], 'columns' => $index['columns']];
+                $constraint = ['kind' => 'unique', 'name' => $index['name'], 'columns' => $index['columns']];
             } else {
-                $constraints[] = ['kind' => 'index', 'name' => $index['name'], 'columns' => $index['columns']];
+                $constraint = ['kind' => 'index', 'name' => $index['name'], 'columns' => $index['columns']];
             }
+            $constraint['ordered'] = (bool) ($index['ordered'] ?? false);
+            $constraints[] = $constraint;
         }
         return $constraints;
     }

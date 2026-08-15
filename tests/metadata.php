@@ -6,6 +6,7 @@ require dirname(__DIR__) . '/src/Autoloader.php';
 
 use FoxyDB\Exception\FoxyException;
 use FoxyDB\Support\BinaryMetadata;
+use FoxyDB\Support\BinaryCodec;
 
 $metadata = [
     'null' => null,
@@ -23,6 +24,29 @@ if (substr($encoded, 0, 4) !== 'FXMD') {
 }
 if (BinaryMetadata::decode($encoded) !== $metadata) {
     throw new RuntimeException('Binary metadata did not round trip exactly.');
+}
+
+foreach ([0, 1, 65_535, 65_536, PHP_INT_MAX] as $integer) {
+    if (BinaryCodec::readUint64(BinaryCodec::uint64($integer)) !== $integer) {
+        throw new RuntimeException('Portable uint64 codec did not round trip.');
+    }
+}
+$uint32Maximum = PHP_INT_SIZE === 8 ? 65_535 * 65_536 + 65_535 : PHP_INT_MAX;
+if (BinaryCodec::readUint32(BinaryCodec::uint32($uint32Maximum)) !== $uint32Maximum) {
+    throw new RuntimeException('Portable uint32 codec did not round trip.');
+}
+if (!hash_equals(BinaryCodec::crc32('portable-crc'), hash('crc32b', 'portable-crc', true))) {
+    throw new RuntimeException('CRC32 was not represented as architecture-neutral bytes.');
+}
+if (PHP_INT_SIZE === 4) {
+    try {
+        BinaryCodec::readUint32("\xff\xff\xff\xff");
+        throw new RuntimeException('Out-of-platform uint32 was accepted.');
+    } catch (FoxyException $exception) {
+        if ($exception->errorCode !== 'PLATFORM_LIMIT') {
+            throw $exception;
+        }
+    }
 }
 
 $corrupt = $encoded;

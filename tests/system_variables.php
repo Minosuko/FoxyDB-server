@@ -58,6 +58,18 @@ try {
     if ($globalSortRows[0]['value'] === '65536') {
         throw new RuntimeException('Session variable override changed the global value.');
     }
+    if (PHP_INT_SIZE >= 8) {
+        $session->execute('SET SESSION sort_buffer_size = 2147483648');
+        $session->execute('SET GLOBAL foxydb_buffer_pool_size = 21474836480');
+        if ($session->variable('sort_buffer_size', 0) !== 2_147_483_648
+            || $variables->get('foxydb_buffer_pool_size') !== 21_474_836_480) {
+            throw new RuntimeException('Runtime memory settings retained an obsolete upper ceiling.');
+        }
+    }
+    $session->execute('SET SESSION wait_timeout = 31536001');
+    if ($session->variable('wait_timeout', 0) !== 31_536_001) {
+        throw new RuntimeException('Runtime timeout retained the former one-year ceiling.');
+    }
 
     $epoch = $storage->cacheStatistics()['mutation_epoch'];
     $session->execute('SET GLOBAL max_allowed_packet = 131072');

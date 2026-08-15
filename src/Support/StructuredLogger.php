@@ -22,7 +22,7 @@ final class StructuredLogger
         private readonly int $maximumArchives,
         private bool $enabled = true,
     ) {
-        if ($directory === '' || $maximumBytes < 1_024 || $maximumArchives < 1 || $maximumArchives > 100) {
+        if ($directory === '' || $maximumBytes < 1_024 || $maximumArchives < 1) {
             throw new FoxyException('Invalid structured logging configuration.', 'INVALID_CONFIG');
         }
         FileSystem::ensureDirectory($directory);

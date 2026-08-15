@@ -50,12 +50,38 @@ if (bin2hex($goldenFrame) !== '4658444202010000000000252e0be20f08000000020000000
     . '70696e67000000026964030000000000000007') {
     throw new RuntimeException('Binary protocol golden frame changed.');
 }
+$wideIntegerBody = chr(8) . pack('N', 1) . pack('N', 1) . 'v' . chr(3)
+    . "\x00\x00\x00\x00\x80\x00\x00\x00";
+$wideIntegerFrame = $frame($wideIntegerBody);
+if (PHP_INT_SIZE === 4) {
+    $expectProtocolError(static function () use ($wideIntegerFrame): void {
+        $buffer = $wideIntegerFrame;
+        FrameCodec::extract($buffer, 1_024);
+    });
+} else {
+    $wideBuffer = $wideIntegerFrame;
+    if (FrameCodec::extract($wideBuffer, 1_024)['v'] !== 2_147_483_648) {
+        throw new RuntimeException('Signed 64-bit protocol integer decoded incorrectly.');
+    }
+}
 $legacyJsonBytes = strlen(json_encode([
     'bytes' => ['$binary' => base64_encode($bytes)],
 ], JSON_THROW_ON_ERROR)) + 4;
 $binaryOnly = FrameCodec::encode(['bytes' => new BinaryValue($bytes)], 1_048_576);
 if (strlen($binaryOnly) >= $legacyJsonBytes) {
     throw new RuntimeException('Binary protocol did not remove Base64 framing overhead.');
+}
+$longKey = str_repeat('k', 2_048);
+$longKeyFrame = FrameCodec::encode([$longKey => 'value'], 1_048_576);
+$longKeyBuffer = $longKeyFrame;
+if (FrameCodec::extract($longKeyBuffer, 1_048_576) !== [$longKey => 'value']) {
+    throw new RuntimeException('Protocol map key was truncated by the former key ceiling.');
+}
+$largeContainer = array_fill(0, 70_000, null);
+$largeContainerFrame = FrameCodec::encode(['items' => $largeContainer], 1_048_576);
+$largeContainerBuffer = $largeContainerFrame;
+if (count(FrameCodec::extract($largeContainerBuffer, 1_048_576)['items']) !== 70_000) {
+    throw new RuntimeException('Protocol container was truncated by the former per-container ceiling.');
 }
 
 $partial = substr($encoded, 0, FrameCodec::HEADER_BYTES - 1);

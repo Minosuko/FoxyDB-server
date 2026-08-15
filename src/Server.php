@@ -38,10 +38,11 @@ final class Server
     private int $pendingFiberOffset = 0;
     private int $activeFibers = 0;
     private int $nextIdleSweep = 0;
+    private int $nextReplicationPrune = 0;
     private readonly StorageEngine $storage;
     private readonly Authentication $authentication;
     private readonly SystemVariables $systemVariables;
-    private readonly TlsCertificate $tlsCertificate;
+    private readonly ?TlsCertificate $tlsCertificate;
     private readonly string $transferDirectory;
     private readonly StructuredLogger $logger;
 
@@ -66,7 +67,7 @@ final class Server
                     $this->sessionCache = array_slice($this->sessionCache, 0, (int) $value);
                 }
             });
-            $this->tlsCertificate = TlsCertificate::ensure($config);
+            $this->tlsCertificate = $config->tlsEnabled ? TlsCertificate::ensure($config) : null;
             $this->transferDirectory = $config->dataDirectory . DIRECTORY_SEPARATOR . '.transfers';
             FileSystem::ensureDirectory($this->transferDirectory);
             $this->removeAbandonedTransfers();
@@ -81,11 +82,14 @@ final class Server
 
     public function run(?callable $onListening = null): void
     {
-        $address = 'tls://' . $this->config->host . ':' . $this->config->port;
+        $address = ($this->config->tlsEnabled ? 'tls://' : 'tcp://')
+            . $this->config->host . ':' . $this->config->port;
         $listenAddress = 'tcp://' . $this->config->host . ':' . $this->config->port;
         $errorCode = 0;
         $errorMessage = '';
-        $context = stream_context_create(['ssl' => $this->tlsCertificate->serverContextOptions()]);
+        $context = $this->tlsCertificate === null
+            ? stream_context_create()
+            : stream_context_create(['ssl' => $this->tlsCertificate->serverContextOptions()]);
         $server = @stream_socket_server(
             $listenAddress,
             $errorCode,
@@ -114,7 +118,7 @@ final class Server
         $this->logger->general('server.started', [
             'host' => $this->config->host,
             'port' => $this->config->port,
-            'tls' => true,
+            'tls' => $this->config->tlsEnabled,
         ]);
 
         try {
@@ -124,7 +128,7 @@ final class Server
                 $read = ['server' => $server];
                 $write = [];
                 foreach ($this->clients as $clientId => $client) {
-                    if (!$client['tls_ready']) {
+                    if (!$client['transport_ready']) {
                         $read[$clientId] = $client['stream'];
                         if ($client['tls_retry_write']) {
                             $write[$clientId] = $client['stream'];
@@ -158,7 +162,7 @@ final class Server
                         if (!isset($this->clients[$clientId])) {
                             continue;
                         }
-                        if (!$this->clients[$clientId]['tls_ready']) {
+                        if (!$this->clients[$clientId]['transport_ready']) {
                             $this->progressTlsHandshake($clientId, true);
                         } else {
                             $this->flushClientOutput($clientId);
@@ -168,7 +172,7 @@ final class Server
                         if (!isset($this->clients[$clientId])) {
                             continue;
                         }
-                        if (!$this->clients[$clientId]['tls_ready']) {
+                        if (!$this->clients[$clientId]['transport_ready']) {
                             $this->progressTlsHandshake($clientId, false);
                         } else {
                             $this->readClient($clientId);
@@ -179,6 +183,19 @@ final class Server
                 if ($now >= $this->nextIdleSweep) {
                     $this->disconnectIdleClients($now);
                     $this->nextIdleSweep = $now + 1;
+                }
+                if ($this->config->replicationEnabled
+                    && $this->config->replicationRetentionHours > 0
+                    && $now >= $this->nextReplicationPrune) {
+                    try {
+                        Replication::prune($this->storage, $this->config, $now);
+                    } catch (\Throwable $exception) {
+                        $this->logger->error('replication.prune_failed', [
+                            'exception' => $exception::class,
+                            'message' => $exception->getMessage(),
+                        ]);
+                    }
+                    $this->nextReplicationPrune = $now + 3_600;
                 }
             }
         } catch (\Throwable $exception) {
@@ -222,6 +239,7 @@ final class Server
         }
         $now = hrtime(true);
         $remaining = [];
+        $rescheduled = [];
         $resumed = 0;
         foreach ($this->readyFibers as $entry) {
             $fiber = $entry['fiber'];
@@ -250,11 +268,11 @@ final class Server
                 continue;
             }
             if ($fiber->isSuspended()) {
-                $remaining[] = $this->suspendedFiber($fiber, $clientId, $suspension);
+                $rescheduled[] = $this->suspendedFiber($fiber, $clientId, $suspension);
             }
             $resumed++;
         }
-        $this->readyFibers = $remaining;
+        $this->readyFibers = [...$remaining, ...$rescheduled];
     }
 
     private function processPendingFibers(): void
@@ -405,7 +423,7 @@ final class Server
                 'close_after_write' => false,
                 'close_reason' => null,
                 'session' => null,
-                'tls_ready' => false,
+                'transport_ready' => false,
                 'tls_retry_write' => false,
                 'authenticated' => false,
                 'interactive' => false,
@@ -420,11 +438,18 @@ final class Server
             ];
             $this->logger->general('connection.accepted', $this->clientContext($id));
             $this->logger->audit('connection.accepted', $this->clientContext($id));
+            if (!$this->config->tlsEnabled) {
+                $this->completeTransport($id);
+            }
         }
     }
 
     private function progressTlsHandshake(int $clientId, bool $fromWrite): void
     {
+        if ($this->tlsCertificate === null) {
+            $this->disconnect($clientId, 'tls_unavailable');
+            return;
+        }
         $stream = $this->clients[$clientId]['stream'];
         if ($fromWrite) {
             $this->clients[$clientId]['tls_retry_write'] = false;
@@ -446,8 +471,14 @@ final class Server
             $this->disconnect($clientId, 'tls_failed');
             return;
         }
-        $this->clients[$clientId]['tls_ready'] = true;
+        $this->clients[$clientId]['transport_ready'] = true;
         $this->logger->audit('tls.established', $this->clientContext($clientId));
+        $this->completeTransport($clientId);
+    }
+
+    private function completeTransport(int $clientId): void
+    {
+        $this->clients[$clientId]['transport_ready'] = true;
         $session = array_pop($this->sessionCache);
         $this->clients[$clientId]['session'] = $session instanceof Session
             ? $session
@@ -459,13 +490,13 @@ final class Server
                 'protocol' => self::PROTOCOL_VERSION,
                 'authenticated' => false,
                 'authentication' => 'username_password',
-                'tls' => [
-                    'required' => true,
-                    'certificate_sha256' => $this->tlsCertificate->fingerprint,
-                ],
-                'capabilities' => [
-                    'binary_protocol', 'raw_binary', 'sql', 'parameters', 'chunked_values', 'streamed_results', 'tls',
-                ],
+                'tls' => $this->tlsCertificate === null
+                    ? ['required' => false]
+                    : ['required' => true, 'certificate_sha256' => $this->tlsCertificate->fingerprint],
+                'capabilities' => array_values(array_filter([
+                    'binary_protocol', 'raw_binary', 'sql', 'parameters', 'chunked_values', 'streamed_results',
+                    $this->tlsCertificate === null ? null : 'tls',
+                ])),
                 'limits' => $this->protocolLimits($clientId),
             ]);
         } catch (\Throwable $exception) {
@@ -496,13 +527,13 @@ final class Server
                 $bufferBytes = strlen($this->clients[$clientId]['buffer']);
                 $request = FrameCodec::extract(
                     $this->clients[$clientId]['buffer'],
-                    $this->config->maxFrameBytes,
+                    FrameCodec::MAXIMUM_FRAME_BYTES,
                 );
                 $consumed = $bufferBytes - strlen($this->clients[$clientId]['buffer']);
                 $this->bufferedInputBytes = max(0, $this->bufferedInputBytes - $consumed);
                 if ($request === null) {
                     if (strlen($this->clients[$clientId]['buffer'])
-                        > $this->config->maxFrameBytes + FrameCodec::HEADER_BYTES) {
+                        > FrameCodec::MAXIMUM_FRAME_BYTES + FrameCodec::HEADER_BYTES) {
                         throw new FoxyException('Frame buffer exceeds its limit.', 'FRAME_TOO_LARGE');
                     }
                     if ($this->bufferedInputBytes > $this->inputBufferLimit()) {
@@ -755,7 +786,7 @@ final class Server
                 if (!is_array($row)) {
                     throw new FoxyException('Query returned an invalid row.', 'INTERNAL_ERROR');
                 }
-                [$encodedRow, $streams] = $this->encodeRow($row, $clientId);
+                [$encodedRow, $streams] = $this->encodeRow($row, $clientId, $requestId);
                 $this->queueFrame($clientId, [
                     'type' => 'row',
                     'id' => $requestId,
@@ -788,12 +819,12 @@ final class Server
         }
     }
 
-    private function encodeRow(array $row, int $clientId): array
+    private function encodeRow(array $row, int $clientId, int $requestId): array
     {
         $encoded = [];
         $streams = [];
         $candidates = [];
-        $threshold = min($this->config->inlineValueBytes, 32_768);
+        $threshold = $this->config->inlineValueBytes;
         foreach ($row as $column => $value) {
             if ($value instanceof ChunkedValue) {
                 $id = bin2hex(random_bytes(12));
@@ -807,7 +838,7 @@ final class Server
             } elseif ($value instanceof BinaryValue && strlen($value->bytes) > $threshold) {
                 $id = bin2hex(random_bytes(12));
                 $bytes = $value->bytes;
-                $chunkBytes = $this->outboundChunkPayloadLimit($clientId);
+                $chunkBytes = $this->outboundChunkPayloadLimit($clientId, $requestId, $id);
                 $encoded[$column] = ['$chunk' => $id, 'format' => 'binary', 'bytes' => strlen($bytes)];
                 $streams[] = [
                     'id' => $id,
@@ -825,7 +856,7 @@ final class Server
             } elseif (is_string($value) && strlen($value) > $threshold) {
                 $id = bin2hex(random_bytes(12));
                 $bytes = $value;
-                $chunkBytes = $this->outboundChunkPayloadLimit($clientId);
+                $chunkBytes = $this->outboundChunkPayloadLimit($clientId, $requestId, $id);
                 $encoded[$column] = ['$chunk' => $id, 'format' => 'utf8', 'bytes' => strlen($bytes)];
                 $streams[] = [
                     'id' => $id,
@@ -844,8 +875,13 @@ final class Server
                 }
             }
         }
-        $budget = max(128, $this->outboundPacketLimit($clientId) - 1_024);
-        if (FrameCodec::encodedValueBytes($encoded) > $budget) {
+        $packetLimit = $this->outboundPacketLimit($clientId);
+        $fitsPacket = static fn(array $values): bool => FrameCodec::encodedValueBytes([
+            'type' => 'row',
+            'id' => $requestId,
+            'row' => $values,
+        ]) <= $packetLimit;
+        if (!$fitsPacket($encoded)) {
             uasort(
                 $candidates,
                 static fn(array $left, array $right): int => strlen($right['value']) <=> strlen($left['value']),
@@ -853,7 +889,7 @@ final class Server
             foreach ($candidates as $column => $candidate) {
                 $id = bin2hex(random_bytes(12));
                 $bytes = $candidate['value'];
-                $chunkBytes = $this->outboundChunkPayloadLimit($clientId);
+                $chunkBytes = $this->outboundChunkPayloadLimit($clientId, $requestId, $id);
                 $encoded[$column] = [
                     '$chunk' => $id,
                     'format' => $candidate['format'],
@@ -869,12 +905,12 @@ final class Server
                         }
                     },
                 ];
-                if (FrameCodec::encodedValueBytes($encoded) <= $budget) {
+                if ($fitsPacket($encoded)) {
                     break;
                 }
             }
         }
-        if (FrameCodec::encodedValueBytes($encoded) > $budget) {
+        if (!$fitsPacket($encoded)) {
             throw new FoxyException('Result row cannot fit in a protocol frame.', 'FRAME_TOO_LARGE');
         }
         return [$encoded, $streams];
@@ -891,7 +927,7 @@ final class Server
             'bytes' => $download['bytes'],
         ]);
         $sent = 0;
-        $chunkBytes = $this->outboundChunkPayloadLimit($clientId);
+        $chunkBytes = $this->outboundChunkPayloadLimit($clientId, (int) $requestId, $download['id']);
         foreach (($download['parts'])() as $part) {
             $sent += strlen($part);
             for ($offset = 0; $offset < strlen($part); $offset += $chunkBytes) {
@@ -935,12 +971,16 @@ final class Server
         }
         $reserved = $declared;
         foreach ($this->clients[$clientId]['transfers'] as $existing) {
-            $reserved += (int) ($existing['declared'] ?? $existing['received']);
+            $existingBytes = (int) ($existing['declared'] ?? $existing['received']);
+            if ($reserved > $this->config->maxUploadBytes - $existingBytes) {
+                throw new FoxyException('The client upload quota has been reached.', 'RESOURCE_LIMIT');
+            }
+            $reserved += $existingBytes;
         }
         if ($reserved > $this->config->maxUploadBytes) {
             throw new FoxyException('The client upload quota has been reached.', 'RESOURCE_LIMIT');
         }
-        if ($this->reservedUploadBytes + $declared > $this->config->maxUploadBytes) {
+        if ($this->reservedUploadBytes > $this->config->maxUploadBytes - $declared) {
             throw new FoxyException('The server upload quota has been reached.', 'RESOURCE_LIMIT');
         }
         $freeBytes = disk_free_space($this->transferDirectory);
@@ -969,7 +1009,7 @@ final class Server
             'id' => $requestId,
             'ok' => true,
             'transfer_id' => $transferId,
-            'chunk_bytes' => $this->chunkPayloadLimit($clientId),
+            'chunk_bytes' => $this->chunkPayloadLimit($clientId, (int) $requestId, $transferId),
         ]);
     }
 
@@ -985,15 +1025,16 @@ final class Server
             throw new FoxyException('Upload transfer is not active.', 'TRANSFER_NOT_FOUND');
         }
         $data = $request['data'] ?? null;
-        if (!($data instanceof BinaryValue) || strlen($data->bytes) > $this->chunkPayloadLimit($clientId)) {
-            throw new FoxyException('Chunk data is invalid or too large.', 'PROTOCOL_ERROR');
+        if (!($data instanceof BinaryValue)) {
+            throw new FoxyException('Chunk data is invalid.', 'PROTOCOL_ERROR');
         }
         $decoded = $data->bytes;
-        $newSize = $transfer['received'] + strlen($decoded);
-        $limit = $transfer['declared'] ?? 4_294_967_295;
-        if ($newSize > $limit) {
+        $limit = $transfer['declared'] ?? PHP_INT_MAX;
+        $chunkLength = strlen($decoded);
+        if ($transfer['received'] > $limit - $chunkLength) {
             throw new FoxyException('Upload exceeds its declared length.', 'INVALID_VALUE');
         }
+        $newSize = $transfer['received'] + $chunkLength;
         FileSystem::writeAll($transfer['stream'], $decoded);
         $transfer['received'] = $newSize;
         unset($transfer);
@@ -1062,7 +1103,7 @@ final class Server
             return $value;
         }
         $transferId = $value['$transfer'];
-        if (!is_string($transferId) || preg_match('/^[A-Za-z0-9_-]{1,128}$/', $transferId) !== 1) {
+        if (!is_string($transferId) || preg_match('/^[A-Za-z0-9_-]+$/', $transferId) !== 1) {
             throw new FoxyException('Referenced transfer identifier is invalid.', 'PROTOCOL_ERROR');
         }
         $transferKey = $this->transferKey($transferId);
@@ -1152,7 +1193,7 @@ final class Server
     private function transferId(array $request): string
     {
         $transferId = $request['transfer_id'] ?? null;
-        if (!is_string($transferId) || preg_match('/^[A-Za-z0-9_-]{1,128}$/', $transferId) !== 1) {
+        if (!is_string($transferId) || preg_match('/^[A-Za-z0-9_-]+$/', $transferId) !== 1) {
             throw new FoxyException('A valid transfer identifier is required.', 'PROTOCOL_ERROR');
         }
         return $transferId;
@@ -1304,8 +1345,8 @@ final class Server
             if ($client['output_buffer'] !== '' && $client['output_since'] !== null
                 && $client['output_since'] <= $now - self::OUTPUT_STALL_TIMEOUT_SECONDS) {
                 $this->disconnect($id, 'write_timeout');
-            } elseif ((!$client['tls_ready'] && $client['connected_at'] < $now - $connectTimeout)
-                || ($client['tls_ready'] && !$client['authenticated']
+            } elseif ((!$client['transport_ready'] && $client['connected_at'] < $now - $connectTimeout)
+                || ($client['transport_ready'] && !$client['authenticated']
                     && $client['connected_at'] < $now - $connectTimeout)
                 || (!$client['query_active'] && $client['last_activity'] < $now - $idleTimeout)) {
                 $this->disconnect($id, 'timeout');
@@ -1368,7 +1409,8 @@ final class Server
             'peer_address' => $client['peer_address'],
             'peer_name' => $client['peer_name'],
             'username' => $client['username'],
-            'tls_ready' => $client['tls_ready'],
+            'transport_ready' => $client['transport_ready'],
+            'tls' => $this->config->tlsEnabled,
             'authenticated' => $client['authenticated'],
             'interactive' => $client['interactive'],
         ];
@@ -1376,7 +1418,7 @@ final class Server
 
     private function globalPacketLimit(): int
     {
-        return min($this->config->maxFrameBytes, (int) $this->systemVariables->get('max_allowed_packet'));
+        return min(FrameCodec::MAXIMUM_FRAME_BYTES, (int) $this->systemVariables->get('max_allowed_packet'));
     }
 
     private function packetLimit(int $clientId): int
@@ -1388,10 +1430,20 @@ final class Server
             : $global;
     }
 
-    private function chunkPayloadLimit(?int $clientId = null): int
+    private function chunkPayloadLimit(
+        ?int $clientId = null,
+        int $requestId = PHP_INT_MAX,
+        string $transferId = '000000000000000000000000',
+    ): int
     {
         $packet = $clientId === null ? $this->globalPacketLimit() : $this->packetLimit($clientId);
-        return max(256, min($this->config->chunkBytes, max(256, $packet - 1_024)));
+        $overhead = FrameCodec::encodedValueBytes([
+            'type' => 'chunk_data',
+            'id' => $requestId,
+            'transfer_id' => $transferId,
+            'data' => new BinaryValue(''),
+        ]);
+        return max(1, min($this->config->chunkBytes, $packet - $overhead));
     }
 
     private function outboundPacketLimit(int $clientId): int
@@ -1401,12 +1453,19 @@ final class Server
         return is_int($peer) ? min($packet, $peer) : $packet;
     }
 
-    private function outboundChunkPayloadLimit(int $clientId): int
+    private function outboundChunkPayloadLimit(int $clientId, int $requestId, string $transferId): int
     {
-        $packet = max(1, $this->outboundPacketLimit($clientId) - 1_024);
+        $packet = $this->outboundPacketLimit($clientId);
+        $overhead = FrameCodec::encodedValueBytes([
+            'type' => 'chunk_data',
+            'id' => $requestId,
+            'transfer_id' => $transferId,
+            'data' => new BinaryValue(''),
+        ]);
+        $payload = max(1, $packet - $overhead);
         $peer = $this->clients[$clientId]['peer_chunk_bytes'] ?? null;
-        $peerLimit = is_int($peer) ? $peer : $packet;
-        return max(1, min($this->config->chunkBytes, $packet, $peerLimit));
+        $peerLimit = is_int($peer) ? $peer : $payload;
+        return max(1, min($this->config->chunkBytes, $payload, $peerLimit));
     }
 
     private function protocolLimits(int $clientId): array

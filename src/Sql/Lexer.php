@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace FoxyDB\Sql;
 
 use FoxyDB\Exception\FoxyException;
+use FoxyDB\Support\Identifiers;
 
 final class Lexer
 {
@@ -60,7 +61,7 @@ final class Lexer
                 );
                 continue;
             }
-            if (preg_match('/[A-Za-z_]/', $character) === 1) {
+            if (Identifiers::isStartByte(ord($character))) {
                 $tokens[] = new Token('IDENTIFIER', $this->readIdentifier(), $offset, $line, $column);
                 continue;
             }
@@ -73,7 +74,7 @@ final class Lexer
                 $tokens[] = new Token('PARAMETER', null, $offset, $line, $column);
                 continue;
             }
-            if ($character === ':' && preg_match('/[A-Za-z_]/', $this->peek(1)) === 1) {
+            if ($character === ':' && Identifiers::isStartByte(ord($this->peek(1)))) {
                 $this->advance();
                 $tokens[] = new Token('PARAMETER', $this->readIdentifier(), $offset, $line, $column);
                 continue;
@@ -86,7 +87,7 @@ final class Lexer
                 $tokens[] = new Token('SYMBOL', $pair, $offset, $line, $column);
                 continue;
             }
-            if (str_contains('(),;.*=<>+-/', $character)) {
+            if (str_contains('(),;.*=<>+-/%', $character)) {
                 $this->advance();
                 $tokens[] = new Token('SYMBOL', $character, $offset, $line, $column);
                 continue;
@@ -135,7 +136,7 @@ final class Lexer
     {
         $start = $this->offset;
         while ($this->offset < $this->length
-            && preg_match('/[A-Za-z0-9_$]/', $this->sql[$this->offset]) === 1) {
+            && Identifiers::isContinueByte(ord($this->sql[$this->offset]))) {
             $this->advance();
         }
         return substr($this->sql, $start, $this->offset - $start);

@@ -201,7 +201,7 @@ final class Client
                         $transferId = $value['$chunk'];
                         $format = $value['format'] ?? null;
                         $bytes = $value['bytes'] ?? null;
-                        if (!is_string($transferId) || preg_match('/^[A-Za-z0-9_-]{1,128}$/', $transferId) !== 1
+                        if (!is_string($transferId) || preg_match('/^[A-Za-z0-9_-]+$/', $transferId) !== 1
                             || !in_array($format, ['binary', 'utf8'], true) || !is_int($bytes) || $bytes < 0
                             || isset($referencedDownloads[$transferId])) {
                             throw new FoxyException('Row contains an invalid chunk reference.', 'PROTOCOL_ERROR');
@@ -310,7 +310,7 @@ final class Client
         }
         $statistics = fstat($stream);
         $bytes = $statistics['size'] ?? false;
-        if ($bytes === false || $bytes > 4_294_967_295) {
+        if (!is_int($bytes) || $bytes < 0) {
             fclose($stream);
             throw new FoxyException('Upload is too large.', 'RESOURCE_LIMIT');
         }
@@ -332,7 +332,6 @@ final class Client
             }
             $chunkBytes = min(
                 $this->uploadChunkBytes,
-                max(1, $this->maximumFrameBytes - 1_024),
                 $serverChunkBytes,
             );
             while (!feof($stream)) {
@@ -450,7 +449,7 @@ final class Client
     private function downloadId(array $frame): string
     {
         $transferId = $frame['transfer_id'] ?? null;
-        if (!is_string($transferId) || preg_match('/^[A-Za-z0-9_-]{1,128}$/', $transferId) !== 1) {
+        if (!is_string($transferId) || preg_match('/^[A-Za-z0-9_-]+$/', $transferId) !== 1) {
             throw new FoxyException('Server sent an invalid transfer identifier.', 'PROTOCOL_ERROR');
         }
         return $transferId;
@@ -515,9 +514,15 @@ final class Client
 
     private function clientLimits(): array
     {
+        $overhead = FrameCodec::encodedValueBytes([
+            'type' => 'chunk_data',
+            'id' => PHP_INT_MAX,
+            'transfer_id' => '000000000000000000000000',
+            'data' => new BinaryValue(''),
+        ]);
         return [
             'frame_payload_bytes' => $this->maximumFrameBytes,
-            'chunk_payload_bytes' => max(1, $this->maximumFrameBytes - 1_024),
+            'chunk_payload_bytes' => max(1, $this->maximumFrameBytes - $overhead),
         ];
     }
 }

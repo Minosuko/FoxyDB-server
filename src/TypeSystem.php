@@ -7,6 +7,7 @@ namespace FoxyDB;
 use DateTimeImmutable;
 use DateTimeZone;
 use FoxyDB\Exception\FoxyException;
+use FoxyDB\Support\Identifiers;
 use FoxyDB\Value\BinaryValue;
 use FoxyDB\Value\ChunkedValue;
 use FoxyDB\Value\StreamValue;
@@ -17,8 +18,7 @@ final class TypeSystem
         'INT', 'VARCHAR', 'BIGINT', 'LONGTEXT', 'TEXT', 'BINARY', 'BLOB', 'TIMESTAMP',
         'DATETIME', 'FLOAT', 'DOUBLE', 'BOOLEAN', 'REAL', 'TINYINT', 'UUID', 'JSON',
     ];
-    private const MAXIMUM_COLUMNS = 1_024;
-    private const MAXIMUM_INDEX_KEY_BYTES = 4_096;
+    private const MAXIMUM_INDEX_KEY_BYTES = 65_535;
 
     public function __construct(private readonly Config $config)
     {
@@ -61,10 +61,6 @@ final class TypeSystem
         if ($columns === []) {
             throw new FoxyException('A table requires at least one column.', 'SCHEMA_ERROR');
         }
-        if (count($columns) > self::MAXIMUM_COLUMNS) {
-            throw new FoxyException('A table cannot have more than 1024 columns.', 'SCHEMA_ERROR');
-        }
-
         $constraints = $definition['constraints'] ?? [];
         foreach ($definition['columns'] as $column) {
             $name = self::identifier($column['name']);
@@ -129,6 +125,8 @@ final class TypeSystem
                 'columns' => $indexColumns,
                 'unique' => $kind !== 'index',
                 'primary' => $kind === 'primary',
+                'ordered' => (bool) ($constraint['ordered'] ?? false),
+                'ordered_codec' => (bool) ($constraint['ordered'] ?? false) ? 2 : null,
             ];
             $this->assertIndexWidth($indexes[$name], $columns);
         }
@@ -305,16 +303,21 @@ final class TypeSystem
         $type = $column['type'];
         return match ($type) {
             'TINYINT' => $this->integer($value, -128, 127, $column['name']),
-            'INT' => $this->integer($value, -2_147_483_648, 2_147_483_647, $column['name']),
+            'INT' => $this->integer(
+                $value,
+                PHP_INT_SIZE === 4 ? PHP_INT_MIN : -2_147_483_647 - 1,
+                min(PHP_INT_MAX, 2_147_483_647),
+                $column['name'],
+            ),
             'BIGINT' => $this->integer($value, PHP_INT_MIN, PHP_INT_MAX, $column['name']),
             'FLOAT' => $this->floating($value, true, $column['name']),
             'DOUBLE', 'REAL' => $this->floating($value, false, $column['name']),
             'BOOLEAN' => $this->boolean($value, $column['name']),
             'VARCHAR' => $this->varchar($value, $column),
             'TEXT' => $this->text($value, 65_535, $column['name'], true),
-            'LONGTEXT' => $this->text($value, 4_294_967_295, $column['name'], true),
+            'LONGTEXT' => $this->text($value, PHP_INT_MAX, $column['name'], true),
             'BINARY' => $this->binary($value, $column['length'], $column['name'], true),
-            'BLOB' => $this->binary($value, 4_294_967_295, $column['name'], false),
+            'BLOB' => $this->binary($value, PHP_INT_MAX, $column['name'], false),
             'TIMESTAMP' => $this->timestamp($value, true, $column['name']),
             'DATETIME' => $this->timestamp($value, false, $column['name']),
             'UUID' => $this->uuid($value, $column['name']),
@@ -369,11 +372,37 @@ final class TypeSystem
         return $left <=> $right;
     }
 
+    /**
+     * The storage-safety gate for every schema name.
+     *
+     * Accepts UTF-8 names (folded deterministically to lowercase), still
+     * rejects path separators and control bytes, and keeps the 64-character
+     * limit so identifiers remain valid as file and directory names.
+     */
     public static function identifier(string $name): string
     {
-        $name = strtolower($name);
-        if (preg_match('/^[a-z_][a-z0-9_]{0,63}$/', $name) !== 1) {
-            throw new FoxyException("Invalid identifier: {$name}", 'INVALID_IDENTIFIER');
+        if ($name === '' || !mb_check_encoding($name, 'UTF-8')) {
+            throw new FoxyException('Invalid identifier.', 'INVALID_IDENTIFIER');
+        }
+        $name = mb_strtolower($name, 'UTF-8');
+        if (preg_match('/\p{M}/u', $name) === 1) {
+            throw new FoxyException('Identifiers must use precomposed Unicode characters.', 'INVALID_IDENTIFIER');
+        }
+        if (mb_strlen($name, 'UTF-8') > 64) {
+            throw new FoxyException('Identifier exceeds 64 characters.', 'INVALID_IDENTIFIER');
+        }
+        $bytes = strlen($name);
+        for ($index = 0; $index < $bytes; $index++) {
+            $byte = ord($name[$index]);
+            $valid = $index === 0
+                ? Identifiers::isStartByte($byte)
+                : Identifiers::isContinueByte($byte);
+            if (!$valid) {
+                throw new FoxyException("Invalid identifier: {$name}", 'INVALID_IDENTIFIER');
+            }
+        }
+        if (preg_match('/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i', $name) === 1) {
+            throw new FoxyException('Identifier is reserved by a supported filesystem.', 'INVALID_IDENTIFIER');
         }
         return $name;
     }
@@ -446,11 +475,15 @@ final class TypeSystem
                 'VARCHAR' => $column['length'] * 4,
                 default => self::MAXIMUM_INDEX_KEY_BYTES + 1,
             };
-            $maximum += 5 + $valueBytes;
+            $maximum += ($index['ordered'] ?? false)
+                ? (in_array($column['type'], ['VARCHAR', 'BINARY', 'UUID', 'TIMESTAMP', 'DATETIME'], true)
+                    ? 3 + (2 * $valueBytes)
+                    : 9)
+                : 5 + $valueBytes;
         }
         if ($maximum > self::MAXIMUM_INDEX_KEY_BYTES) {
             throw new FoxyException(
-                "Index {$index['name']} can exceed the 4096-byte key limit.",
+                "Index {$index['name']} can exceed the 16-bit key storage format.",
                 'SCHEMA_ERROR',
             );
         }

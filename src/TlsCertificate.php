@@ -71,7 +71,14 @@ final readonly class TlsCertificate
             throw new FoxyException('TLS certificate and private key are invalid or do not match.', 'TLS_CONFIG');
         }
         $details = openssl_x509_parse($certificate);
-        if ($details === false || (int) ($details['validTo_time_t'] ?? 0) <= time()) {
+        $expires = null;
+        if (is_array($details) && is_string($details['validTo'] ?? null)) {
+            try {
+                $expires = new \DateTimeImmutable($details['validTo'], new \DateTimeZone('UTC'));
+            } catch (\Throwable) {
+            }
+        }
+        if ($expires === null || $expires <= new \DateTimeImmutable('now', new \DateTimeZone('UTC'))) {
             throw new FoxyException('TLS certificate is expired or cannot be parsed.', 'TLS_CONFIG');
         }
         $fingerprint = openssl_x509_fingerprint($certificate, 'sha256');

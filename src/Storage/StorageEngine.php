@@ -184,7 +184,7 @@ final class StorageEngine
             }
             $databases = [];
             foreach ($entries as $entry) {
-                if (preg_match('/^[a-z_][a-z0-9_]{0,63}$/', $entry) === 1
+                if (self::isCanonicalName($entry)
                     && is_dir($this->databasesPath . DIRECTORY_SEPARATOR . $entry)) {
                     $databases[] = $entry;
                 }
@@ -304,6 +304,13 @@ final class StorageEngine
             if (!@rename($oldPath, $newPath)) {
                 throw new FoxyException('Unable to rename table directory.', 'STORAGE_IO');
             }
+            try {
+                $this->rewriteTableIdentity($newPath, $newName, false);
+            } catch (\Throwable $exception) {
+                @rename($newPath, $oldPath);
+                throw $exception;
+            }
+            $this->indexCache->clear();
             $this->invalidateTableCaches($database, $oldName);
             $this->invalidateTableCaches($database, $newName);
         } finally {
@@ -357,6 +364,13 @@ final class StorageEngine
             if (!@rename($oldPath, $newPath)) {
                 throw new FoxyException('Unable to move table directory.', 'STORAGE_IO');
             }
+            try {
+                $this->rewriteTableIdentity($newPath, $targetTable, false);
+            } catch (\Throwable $exception) {
+                @rename($newPath, $oldPath);
+                throw $exception;
+            }
+            $this->indexCache->clear();
             $this->invalidateTableCaches($database, $table);
             $this->invalidateTableCaches($targetDatabase, $targetTable);
         } finally {
@@ -409,6 +423,13 @@ final class StorageEngine
                 throw new FoxyException("Table {$targetTable} already exists in target database.", 'TABLE_EXISTS');
             }
             FileSystem::copyTree($srcPath, $dstPath);
+            try {
+                $this->rewriteTableIdentity($dstPath, $targetTable, true);
+            } catch (\Throwable $exception) {
+                FileSystem::removeTree($dstPath);
+                throw $exception;
+            }
+            $this->indexCache->clear();
             $this->invalidateTableCaches($targetDatabase, $targetTable);
         } finally {
             if ($dstTableLock !== null) {
@@ -442,7 +463,7 @@ final class StorageEngine
             }
             $tables = [];
             foreach ($entries as $entry) {
-                if (preg_match('/^[a-z_][a-z0-9_]{0,63}$/', $entry) === 1
+                if (self::isCanonicalName($entry)
                     && is_dir($tablesPath . DIRECTORY_SEPARATOR . $entry)) {
                     $tables[] = $entry;
                 }
@@ -603,21 +624,49 @@ final class StorageEngine
         $this->mutationEpoch++;
     }
 
+    /** True for a name that is already in canonical on-disk form. */
+    private static function isCanonicalName(string $name): bool
+    {
+        try {
+            return TypeSystem::identifier($name) === $name;
+        } catch (FoxyException) {
+            return false;
+        }
+    }
+
     private function tableKey(string $database, string $table): string
     {
         return $database . '.' . $table;
     }
 
+    private function rewriteTableIdentity(string $path, string $name, bool $newIdentity): void
+    {
+        $metadataPath = $path . DIRECTORY_SEPARATOR . 'meta.fdb';
+        $metadata = FileSystem::readMetadata($metadataPath);
+        $metadata['name'] = $name;
+        if ($newIdentity) {
+            $metadata['table_id'] = bin2hex(random_bytes(16));
+        }
+        FileSystem::writeMetadata($metadataPath, $metadata, $this->config->syncWrites);
+    }
+
     private function lock(string $path, int $operation)
     {
-        $stream = @fopen($path, 'c+b');
-        if ($stream === false || !flock($stream, $operation)) {
-            if (is_resource($stream)) {
-                fclose($stream);
+        while (true) {
+            $stream = @fopen($path, 'c+b');
+            if ($stream === false) {
+                throw new FoxyException('Unable to open catalog lock.', 'STORAGE_LOCK');
             }
-            throw new FoxyException('Unable to acquire catalog lock.', 'STORAGE_LOCK');
+            if (flock($stream, $operation | LOCK_NB)) {
+                return $stream;
+            }
+            fclose($stream);
+            if (class_exists(\Fiber::class) && \Fiber::getCurrent() !== null) {
+                \FoxyDB\Server::fiberYield(1_000);
+            } else {
+                usleep(1_000);
+            }
         }
-        return $stream;
     }
 
     private function releaseLock($stream): void

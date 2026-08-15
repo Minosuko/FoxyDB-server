@@ -12,32 +12,32 @@ final class SystemVariables
 {
     private const DEFINITIONS = [
         'foxydb_buffer_pool_size' => [
-            'type' => 'bytes', 'default' => 67_108_864, 'min' => 0, 'max' => 17_179_869_184,
+            'type' => 'bytes', 'default' => 67_108_864, 'min' => 0, 'max' => false,
             'scope' => 'GLOBAL', 'dynamic' => true,
             'description' => 'Maximum bytes retained by the decoded row buffer pool.',
         ],
         'max_heap_table_size' => [
-            'type' => 'bytes', 'default' => 67_108_864, 'min' => 1_048_576, 'max' => 4_294_967_296,
+            'type' => 'bytes', 'default' => 67_108_864, 'min' => 1, 'max' => false,
             'scope' => 'BOTH', 'dynamic' => true,
             'description' => 'Maximum bytes staged by an in-memory query operation.',
         ],
         'sort_buffer_size' => [
-            'type' => 'bytes', 'default' => 2_097_152, 'min' => 32_768, 'max' => 1_073_741_824,
+            'type' => 'bytes', 'default' => 2_097_152, 'min' => 1, 'max' => false,
             'scope' => 'BOTH', 'dynamic' => true,
             'description' => 'Per-session memory limit for ORDER BY sorting.',
         ],
         'join_buffer_size' => [
-            'type' => 'bytes', 'default' => 2_097_152, 'min' => 32_768, 'max' => 1_073_741_824,
+            'type' => 'bytes', 'default' => 2_097_152, 'min' => 1, 'max' => false,
             'scope' => 'BOTH', 'dynamic' => true,
             'description' => 'Reserved per-session memory limit for join execution.',
         ],
         'query_cache_size' => [
-            'type' => 'bytes', 'default' => 16_777_216, 'min' => 0, 'max' => 4_294_967_296,
+            'type' => 'bytes', 'default' => 16_777_216, 'min' => 0, 'max' => false,
             'scope' => 'GLOBAL', 'dynamic' => true,
             'description' => 'Maximum bytes retained by the process-wide SELECT result cache.',
         ],
         'tmp_table_size' => [
-            'type' => 'bytes', 'default' => 67_108_864, 'min' => 1_048_576, 'max' => 4_294_967_296,
+            'type' => 'bytes', 'default' => 67_108_864, 'min' => 1, 'max' => false,
             'scope' => 'BOTH', 'dynamic' => true,
             'description' => 'Maximum bytes allowed for an in-memory temporary result.',
         ],
@@ -47,22 +47,22 @@ final class SystemVariables
             'description' => 'Maximum bytes in one framed protocol packet.',
         ],
         'connect_timeout' => [
-            'type' => 'integer', 'default' => 10, 'min' => 1, 'max' => 3_600,
+            'type' => 'integer', 'default' => 10, 'min' => 1, 'max' => false,
             'scope' => 'GLOBAL', 'dynamic' => true,
             'description' => 'Seconds allowed for TLS negotiation and authentication.',
         ],
         'wait_timeout' => [
-            'type' => 'integer', 'default' => 300, 'min' => 1, 'max' => 31_536_000,
+            'type' => 'integer', 'default' => 300, 'min' => 1, 'max' => false,
             'scope' => 'BOTH', 'dynamic' => true,
             'description' => 'Idle timeout in seconds for non-interactive sessions.',
         ],
         'interactive_timeout' => [
-            'type' => 'integer', 'default' => 300, 'min' => 1, 'max' => 31_536_000,
+            'type' => 'integer', 'default' => 300, 'min' => 1, 'max' => false,
             'scope' => 'BOTH', 'dynamic' => true,
             'description' => 'Idle timeout in seconds for interactive sessions.',
         ],
         'max_connect_errors' => [
-            'type' => 'integer', 'default' => 100, 'min' => 1, 'max' => 1_000_000,
+            'type' => 'integer', 'default' => 100, 'min' => 1, 'max' => false,
             'scope' => 'GLOBAL', 'dynamic' => true,
             'description' => 'Connection errors allowed per address within the blocking window.',
         ],
@@ -72,12 +72,12 @@ final class SystemVariables
             'description' => 'Skip reverse DNS resolution for incoming peers.',
         ],
         'thread_cache_size' => [
-            'type' => 'integer', 'default' => 16, 'min' => 0, 'max' => 1_024,
+            'type' => 'integer', 'default' => 16, 'min' => 0, 'max' => false,
             'scope' => 'GLOBAL', 'dynamic' => true,
             'description' => 'Maximum reset Session objects retained by the event loop.',
         ],
         'thread_stack' => [
-            'type' => 'bytes', 'default' => 1_048_576, 'min' => 131_072, 'max' => 16_777_216,
+            'type' => 'bytes', 'default' => 1_048_576, 'min' => 1, 'max' => false,
             'scope' => 'GLOBAL', 'dynamic' => false,
             'description' => 'Compatibility value for worker stack sizing; PHP owns the actual stack.',
         ],
@@ -229,9 +229,11 @@ final class SystemVariables
 
     private function boundedInteger(string $name, int $value, array $definition): int
     {
-        if ($value < $definition['min'] || $value > $definition['max']) {
+        $declaredMaximum = filter_var($definition['max'], FILTER_VALIDATE_INT);
+        $maximum = $declaredMaximum === false ? PHP_INT_MAX : min(PHP_INT_MAX, (int) $declaredMaximum);
+        if ($value < $definition['min'] || $value > $maximum) {
             throw new FoxyException(
-                "System variable {$name} must be from {$definition['min']} to {$definition['max']}.",
+                "System variable {$name} must be from {$definition['min']} to {$maximum} on this platform.",
                 'INVALID_SYSTEM_VARIABLE',
             );
         }
@@ -250,17 +252,16 @@ final class SystemVariables
         if ($base === false) {
             throw new FoxyException('Byte-size variable exceeds the integer range.', 'INVALID_SYSTEM_VARIABLE');
         }
-        $multiplier = match (strtoupper($match[2] ?? '')) {
-            'K' => 1_024,
-            'M' => 1_048_576,
-            'G' => 1_073_741_824,
-            'T' => 1_099_511_627_776,
-            default => 1,
+        $powers = match (strtoupper($match[2] ?? '')) {
+            'K' => 1, 'M' => 2, 'G' => 3, 'T' => 4, default => 0,
         };
-        if ($base > intdiv(PHP_INT_MAX, $multiplier)) {
-            throw new FoxyException('Byte-size variable exceeds the integer range.', 'INVALID_SYSTEM_VARIABLE');
+        for ($power = 0; $power < $powers; $power++) {
+            if ($base > intdiv(PHP_INT_MAX, 1_024)) {
+                throw new FoxyException('Byte-size variable exceeds the integer range.', 'INVALID_SYSTEM_VARIABLE');
+            }
+            $base *= 1_024;
         }
-        return $base * $multiplier;
+        return $base;
     }
 
     private static function parseInteger(mixed $value): int

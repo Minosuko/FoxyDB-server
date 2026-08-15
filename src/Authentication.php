@@ -18,7 +18,12 @@ final class Authentication
     private string $dummyPasswordHash;
     private readonly MemoryCache $userCache;
     private readonly MemoryCache $privilegeCache;
+    private readonly MemoryCache $roleCache;
     private string $authorizationRevision = '';
+    private const PRIVILEGES = [
+        'ALL', 'SHOW', 'CONNECT', 'CREATE', 'DROP', 'INDEX', 'SELECT',
+        'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'ALTER',
+    ];
 
     public function __construct(
         private readonly StorageEngine $storage,
@@ -26,6 +31,7 @@ final class Authentication
     ) {
         $this->userCache = new MemoryCache(2_097_152);
         $this->privilegeCache = new MemoryCache(4_194_304);
+        $this->roleCache = new MemoryCache(2_097_152);
         $this->dummyPasswordHash = $this->hashPassword(bin2hex(random_bytes(32)));
         $this->bootstrapWithLock();
     }
@@ -95,15 +101,18 @@ final class Authentication
         }
         $effectiveAccountId = $accountId ?? $user['account_id'];
         $privilege = strtoupper($privilege);
-        foreach ($this->privilegesFor($effectiveAccountId) as $row) {
-            if ($row['username'] !== $username || !hash_equals($row['account_id'], $effectiveAccountId)) {
-                continue;
-            }
-            $privilegeMatches = $row['privilege'] === 'ALL' || $row['privilege'] === $privilege;
-            $databaseMatches = $row['database_name'] === '*' || $row['database_name'] === $database;
-            $tableMatches = $row['table_name'] === '*' || $row['table_name'] === $table;
-            if ($privilegeMatches && $databaseMatches && $tableMatches) {
-                return true;
+        $effectiveAccounts = [$effectiveAccountId, ...$this->roleIdsFor($username, $effectiveAccountId)];
+        foreach ($effectiveAccounts as $candidateAccountId) {
+            foreach ($this->privilegesFor($candidateAccountId) as $row) {
+                if (!hash_equals($row['account_id'], $candidateAccountId)) {
+                    continue;
+                }
+                $privilegeMatches = $row['privilege'] === 'ALL' || $row['privilege'] === $privilege;
+                $databaseMatches = self::nameMatches((string) $row['database_name'], $database);
+                $tableMatches = self::nameMatches((string) $row['table_name'], $table);
+                if ($privilegeMatches && $databaseMatches && $tableMatches) {
+                    return true;
+                }
             }
         }
         return false;
@@ -125,6 +134,45 @@ final class Authentication
             throw new FoxyException('Username is invalid.', 'AUTH_FAILED');
         }
         return $username;
+    }
+
+    /**
+     * Matches a stored grant name against a requested name.
+     *
+     * A pattern of '*' or '%' matches every name. A '%' anywhere else in the
+     * pattern acts as a LIKE-style multi-character wildcard anchored to the
+     * full name; every other byte, including '_', is literal. Both names are
+     * already in canonical folded form.
+     */
+    private static function nameMatches(string $pattern, string $name): bool
+    {
+        if ($pattern === '*' || $pattern === '%' || $pattern === $name) {
+            return true;
+        }
+        if (!str_contains($pattern, '%')) {
+            return false;
+        }
+        $regex = '~^' . str_replace('%', '.*', preg_quote($pattern, '~')) . '$~';
+        return preg_match($regex, $name) === 1;
+    }
+
+    private static function validGrantPattern(mixed $pattern): bool
+    {
+        if (!is_string($pattern)) {
+            return false;
+        }
+        if ($pattern === '*' || $pattern === '%') {
+            return true;
+        }
+        $name = str_ends_with($pattern, '%') ? substr($pattern, 0, -1) : $pattern;
+        if ($name === '' || str_contains($name, '%')) {
+            return false;
+        }
+        try {
+            return TypeSystem::identifier($name) === $name;
+        } catch (FoxyException) {
+            return false;
+        }
     }
 
     private function bootstrap(): void
@@ -240,13 +288,84 @@ final class Authentication
         $privileges = $this->storage->table(self::SYSTEM_DATABASE, 'privileges');
         $lookup = $privileges->lookupForEqualities(['account_id' => $accountId]);
         foreach ($privileges->rows($lookup) as $entry) {
-            $rows[] = $entry['values'];
+            $row = $entry['values'];
+            if (!in_array($row['privilege'] ?? null, self::PRIVILEGES, true)
+                || !self::validGrantPattern($row['database_name'] ?? null)
+                || !self::validGrantPattern($row['table_name'] ?? null)) {
+                throw new FoxyException('Stored privilege contains an invalid grant.', 'STORAGE_CORRUPT');
+            }
+            $rows[] = $row;
         }
         $this->privilegeCache->put($accountId, ['rows' => $rows]);
         return $rows;
     }
 
-    private function synchronizeAuthorizationCaches(): void
+    public function roleIdsFor(string $username, ?string $accountId = null): array
+    {
+        $username = self::normalizeUsername($username);
+        $accountId ??= $this->findUser($username)['account_id'] ?? null;
+        if ($accountId === null) {
+            return [];
+        }
+        $this->synchronizeAuthorizationCaches();
+        $cacheKey = 'ids:' . $username . ':' . $accountId;
+        $cached = $this->roleCache->get($cacheKey);
+        if (is_array($cached) && isset($cached['ids']) && is_array($cached['ids'])) {
+            return $cached['ids'];
+        }
+        $ids = [];
+        try {
+            $assignments = $this->storage->table(self::SYSTEM_DATABASE, 'role_assignments');
+            $lookup = $assignments->lookupForEqualities(['account_id' => $accountId]);
+            foreach ($assignments->rows($lookup) as $entry) {
+                if ($entry['values']['username'] !== $username
+                    || !hash_equals((string) $entry['values']['account_id'], $accountId)) {
+                    continue;
+                }
+                $ids[] = $entry['values']['role_id'];
+            }
+        } catch (FoxyException) {
+        }
+        $this->roleCache->put($cacheKey, ['ids' => $ids]);
+        return $ids;
+    }
+
+    public function roleNamesFor(string $username, ?string $accountId = null): array
+    {
+        $username = self::normalizeUsername($username);
+        $accountId ??= $this->findUser($username)['account_id'] ?? null;
+        if ($accountId === null) {
+            return [];
+        }
+        $this->synchronizeAuthorizationCaches();
+        $cacheKey = 'names:' . $username . ':' . $accountId;
+        $cached = $this->roleCache->get($cacheKey);
+        if (is_array($cached) && isset($cached['roles']) && is_array($cached['roles'])) {
+            return $cached['roles'];
+        }
+        $roles = [];
+        try {
+            $assignments = $this->storage->table(self::SYSTEM_DATABASE, 'role_assignments');
+            $roleTable = $this->storage->table(self::SYSTEM_DATABASE, 'roles');
+            $lookup = $assignments->lookupForEqualities(['account_id' => $accountId]);
+            foreach ($assignments->rows($lookup) as $entry) {
+                if ($entry['values']['username'] !== $username
+                    || !hash_equals((string) $entry['values']['account_id'], $accountId)) {
+                    continue;
+                }
+                $roleId = $entry['values']['role_id'];
+                $roleLookup = $roleTable->lookupForEqualities(['role_id' => $roleId]);
+                foreach ($roleTable->rows($roleLookup) as $roleEntry) {
+                    $roles[] = $roleEntry['values']['role_name'];
+                }
+            }
+        } catch (FoxyException) {
+        }
+        $this->roleCache->put($cacheKey, ['roles' => $roles]);
+        return $roles;
+    }
+
+    public function synchronizeAuthorizationCaches(): void
     {
         $revision = $this->storage->tableRevision(self::SYSTEM_DATABASE, 'users_schema')
             . ':' . $this->storage->tableRevision(self::SYSTEM_DATABASE, 'privileges')
@@ -258,6 +377,7 @@ final class Authentication
         $this->authorizationRevision = $revision;
         $this->userCache->clear();
         $this->privilegeCache->clear();
+        $this->roleCache->clear();
     }
 
     public static function ensureSystemSchema(StorageEngine $storage, Config $config): void
@@ -274,6 +394,8 @@ final class Authentication
                 true,
             );
         }
+        self::migrateRoleAssignments($storage);
+        self::migratePolicyScopes($storage);
     }
 
     /**
@@ -388,6 +510,9 @@ final class Authentication
                     ['name' => 'database_name', 'type' => 'VARCHAR', 'length' => 64, 'nullable' => false],
                     ['name' => 'table_name', 'type' => 'VARCHAR', 'length' => 64, 'nullable' => false],
                     ['name' => 'operation', 'type' => 'VARCHAR', 'length' => 16, 'nullable' => false],
+                    ['name' => 'username', 'type' => 'VARCHAR', 'length' => 64, 'nullable' => true],
+                    ['name' => 'scope_type', 'type' => 'VARCHAR', 'length' => 16, 'nullable' => true],
+                    ['name' => 'scope_id', 'type' => 'UUID', 'nullable' => true],
                     ['name' => 'expression_sql', 'type' => 'TEXT', 'nullable' => true],
                     ['name' => 'created_at', 'type' => 'TIMESTAMP', 'nullable' => false, 'default' => ['expression' => 'current_timestamp']],
                 ],
@@ -413,11 +538,13 @@ final class Authentication
             'role_assignments' => [
                 'columns' => [
                     ['name' => 'username', 'type' => 'VARCHAR', 'length' => 64, 'nullable' => false],
+                    ['name' => 'account_id', 'type' => 'UUID', 'nullable' => false],
                     ['name' => 'role_id', 'type' => 'UUID', 'nullable' => false],
                     ['name' => 'granted_at', 'type' => 'TIMESTAMP', 'nullable' => false, 'default' => ['expression' => 'current_timestamp']],
                 ],
                 'constraints' => [
-                    ['kind' => 'primary', 'name' => 'primary', 'columns' => ['username', 'role_id']],
+                    ['kind' => 'primary', 'name' => 'primary', 'columns' => ['account_id', 'role_id']],
+                    ['kind' => 'index', 'name' => 'idx_ra_username', 'columns' => ['username']],
                     ['kind' => 'index', 'name' => 'idx_ra_role', 'columns' => ['role_id']],
                 ],
             ],
@@ -438,6 +565,106 @@ final class Authentication
                 ],
             ],
         ];
+    }
+
+    private static function migrateRoleAssignments(StorageEngine $storage): void
+    {
+        $assignments = $storage->table(self::SYSTEM_DATABASE, 'role_assignments');
+        if (!in_array('account_id', array_column($assignments->schema()['columns'], 'name'), true)) {
+            $assignments->alterSchema([[
+                'kind' => 'add_column',
+                'column' => ['name' => 'account_id', 'type' => 'UUID', 'nullable' => true],
+            ]]);
+        }
+        $users = $storage->table(self::SYSTEM_DATABASE, 'users_schema');
+        foreach ($assignments->rows() as $entry) {
+            $username = (string) $entry['values']['username'];
+            $accountId = null;
+            $createdAt = null;
+            foreach ($users->rows($users->lookupForEqualities(['username' => $username])) as $user) {
+                if ($user['values']['username'] === $username) {
+                    $accountId = $user['values']['account_id'];
+                    $createdAt = $user['values']['created_at'];
+                    break;
+                }
+            }
+            $grantedAt = $entry['values']['granted_at'] ?? null;
+            if ($accountId === null || ($createdAt instanceof \DateTimeInterface
+                && $grantedAt instanceof \DateTimeInterface && $grantedAt < $createdAt)) {
+                $assignments->delete(static fn(array $row): bool =>
+                    $row['username'] === $username && $row['role_id'] === $entry['values']['role_id']
+                );
+                continue;
+            }
+            if (($entry['values']['account_id'] ?? null) !== $accountId) {
+                $roleId = $entry['values']['role_id'];
+                $assignments->update(
+                    ['account_id' => $accountId],
+                    static fn(array $row): bool =>
+                        $row['username'] === $username && $row['role_id'] === $roleId,
+                );
+            }
+        }
+    }
+
+    private static function migratePolicyScopes(StorageEngine $storage): void
+    {
+        $policies = $storage->table(self::SYSTEM_DATABASE, 'policies');
+        $columns = array_column($policies->schema()['columns'], 'name');
+        $actions = [];
+        if (!in_array('scope_type', $columns, true)) {
+            $actions[] = [
+                'kind' => 'add_column',
+                'column' => ['name' => 'scope_type', 'type' => 'VARCHAR', 'length' => 16, 'nullable' => true],
+            ];
+        }
+        if (!in_array('scope_id', $columns, true)) {
+            $actions[] = [
+                'kind' => 'add_column',
+                'column' => ['name' => 'scope_id', 'type' => 'UUID', 'nullable' => true],
+            ];
+        }
+        if ($actions !== []) {
+            $policies->alterSchema($actions);
+        }
+        $users = $storage->table(self::SYSTEM_DATABASE, 'users_schema');
+        $roles = $storage->table(self::SYSTEM_DATABASE, 'roles');
+        foreach ($policies->rows() as $entry) {
+            $row = $entry['values'];
+            $scope = $row['username'] ?? null;
+            if ($scope === null || $scope === '' || (($row['scope_type'] ?? null) !== null
+                && ($row['scope_id'] ?? null) !== null)) {
+                continue;
+            }
+            $matches = [];
+            foreach ($users->rows($users->lookupForEqualities(['username' => $scope])) as $user) {
+                if ($user['values']['username'] === $scope) {
+                    $matches[] = ['type' => 'user', 'id' => $user['values']['account_id']];
+                }
+            }
+            foreach ($roles->rows($roles->lookupForEqualities(['role_name' => $scope])) as $role) {
+                if ($role['values']['role_name'] === $scope) {
+                    $matches[] = ['type' => 'role', 'id' => $role['values']['role_id']];
+                }
+            }
+            $identity = [
+                'policy_name' => $row['policy_name'],
+                'database_name' => $row['database_name'],
+                'table_name' => $row['table_name'],
+            ];
+            if (count($matches) !== 1) {
+                $policies->delete(null, $policies->lookupForEqualities($identity));
+                continue;
+            }
+            $policies->update(
+                ['scope_type' => $matches[0]['type'], 'scope_id' => $matches[0]['id']],
+                static fn(array $candidate): bool =>
+                    $candidate['policy_name'] === $identity['policy_name']
+                    && $candidate['database_name'] === $identity['database_name']
+                    && $candidate['table_name'] === $identity['table_name'],
+                $policies->lookupForEqualities($identity),
+            );
+        }
     }
 
     private function bootstrapWithLock(): void

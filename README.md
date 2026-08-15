@@ -10,9 +10,10 @@ For SQLite-style deployment without a daemon or network connection, use the [`Mi
 
 - TCP server on `127.0.0.1:2002` by default
 - TLS 1.2 and TLS 1.3 encryption on every network connection
+- Cooperative query scheduling: while one connection streams a large result, other connections are authenticated and served concurrently
 - SQL lexer, parser, typed AST, and execution engine (statements up to 16 MiB and 1,000,000 tokens)
 - `INT`, `VARCHAR`, `BIGINT`, `LONGTEXT`, `TEXT`, `BINARY`, `BLOB`, `TIMESTAMP`, `DATETIME`, `FLOAT`, `DOUBLE`, `BOOLEAN`, `REAL`, `TINYINT`, `UUID`, and `JSON`
-- Primary, unique, and non-unique hash indexes
+- Primary, unique, and non-unique hash indexes, plus `ORDERED` range indexes for comparison predicates
 - `JSON` columns with `JSON_EXTRACT` predicates and projections
 - `AUTO_INCREMENT` integer keys
 - Append-only row data with fixed-size row directory slots
@@ -20,14 +21,15 @@ For SQLite-style deployment without a daemon or network connection, use the [`Mi
 - Content-addressed, deduplicated chunks for large text and binary values
 - Bounded batch scans and configurable row, frame, upload, and materialization limits
 - Online table compaction under an exclusive table lock
-- Persistent username/password authentication and table-level privileges
+- Persistent username/password authentication, table-level privileges, roles, and role-scoped row-level policies
+- Source-side changelog replication to a follower FoxyDB daemon over TLS
 - Persistent global and per-session system variables with bounded memory caches
 - Rotating JSON-lines general, error, audit, and slow-query logs
 - PHP client with certificate verification, parameter binding, and chunk upload support
 
 ## Requirements
 
-- 64-bit PHP 8.2 or newer
+- 32-bit or 64-bit PHP 8.2 or newer
 - `json`, `mbstring`, `openssl`, and `zlib` PHP extensions
 - Permission to create and update the configured data directory
 
@@ -134,7 +136,7 @@ $db->query(
 );
 ```
 
-Root receives `ALL` on `*.*`. Other accounts require rows in `privileges`. Grants include both `username` and the matching `account_id`, so deleting and recreating a username does not inherit stale access. Clients cannot insert or update `users_schema.account_id`. Supported authorization names are `ALL`, `SHOW`, `CONNECT`, `CREATE`, `DROP`, `INDEX`, `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and `ALTER`. A grant can use `*` for its database or table. System database and table deletion is blocked.
+Root receives `ALL` on `*.*`. Other accounts require rows in `privileges`. Grants include both `username` and the matching `account_id`, so deleting and recreating a username does not inherit stale access. Clients cannot insert or update `users_schema.account_id`. Supported authorization names are `ALL`, `SHOW`, `CONNECT`, `CREATE`, `DROP`, `INDEX`, `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, and `ALTER`. A grant can use `*` for its database or table. System database and table deletion is blocked.
 
 ## System Variables
 
@@ -268,25 +270,58 @@ SET [GLOBAL | SESSION] variable = value;
 CREATE TABLE [IF NOT EXISTS] name (...);
 DROP TABLE [IF EXISTS] name;
 TRUNCATE TABLE name;
+ALTER TABLE name
+    ADD [COLUMN] definition | ADD [UNIQUE] INDEX [KEY] name (column, ...) [ORDERED]
+    | ADD [CONSTRAINT] definition | ADD PRIMARY KEY ...
+    | DROP PRIMARY KEY | DROP INDEX name | DROP CONSTRAINT name | DROP [COLUMN] name
+    | MODIFY [COLUMN] definition | CHANGE [COLUMN] old_definition
+    | RENAME TO name | RENAME COLUMN old TO new | RENAME INDEX old TO new
+    | COMPACT | OPTIMIZE | DEFRAGMENT
+    | AUTO_INCREMENT = value | COLLATE name;
+RENAME TABLE old TO new;
+ANALYZE TABLE name;
+CHECK TABLE name;
+CHECKSUM TABLE name;
+FLUSH TABLE name;
 DESCRIBE name;
-COMPACT TABLE name;
 
-CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column, ...);
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column, ...) [ORDERED];
 DROP INDEX [IF EXISTS] name ON table;
 SHOW INDEXES FROM table;
 
+COMPACT TABLE name;
+
+CREATE ROLE name;
+DROP ROLE name;
+GRANT privilege ON database.table TO grantee;
+GRANT ALL ON database.* TO grantee;
+GRANT role TO grantee;
+REVOKE privilege ON database.table FROM grantee;
+REVOKE ALL ON database.* FROM grantee;
+REVOKE role FROM grantee;
+CREATE POLICY name ON table FOR SELECT|INSERT|UPDATE|DELETE|ALL [TO user_or_role] USING (expression);
+DROP POLICY name [IF EXISTS] ON table;
+
+BEGIN [TRANSACTION];
+COMMIT [TRANSACTION];
+ROLLBACK [TRANSACTION];
+
 INSERT INTO table [(column, ...)] VALUES (...), (...);
 SELECT columns FROM table
+    [JOIN ... ON ...]
     [WHERE expression]
+    [GROUP BY column, ... [HAVING expression]]
     [ORDER BY column [ASC|DESC], ...]
     [LIMIT count [OFFSET offset]];
 UPDATE table SET column = value [, ...] [WHERE expression];
 DELETE FROM table [WHERE expression];
 ```
 
-`WHERE` supports `AND`, `OR`, `NOT`, comparison operators, `IS NULL`, `IS NOT NULL`, `IN`, `NOT IN`, `LIKE`, and `NOT LIKE`. In `LIKE` patterns, `%` matches any sequence, `_` matches one character, and a backslash escapes either wildcard. SQL NULL uses three-valued predicate behavior. `COUNT(*)` is supported without grouping.
+`WHERE` supports `AND`, `OR`, `NOT`, comparison operators, `IS NULL`, `IS NOT NULL`, `IN`, `NOT IN`, `LIKE`, and `NOT LIKE`. In `LIKE` patterns, `%` matches any sequence, `_` matches one character, and a backslash escapes either wildcard. SQL NULL uses three-valued predicate behavior. Joins (`INNER`, `LEFT`, `RIGHT`, `CROSS`), grouping with `HAVING`, `ORDER BY`, and bounded `LIMIT`/`OFFSET` are supported, and `IN`, `EXISTS`, and scalar subqueries may reference other tables.
 
 Positional `?` and named `:name` parameters are supported. Parameter values are never interpolated into SQL text.
+
+Transactions accept DML and SELECT statements only; DDL and administration fail with `TRANSACTION_DDL`. Query-cache access is disabled while a transaction is active, rollback rebuilds affected indexes and invalidates table revisions, and replication entries are published only by COMMIT.
 
 Column examples:
 
@@ -315,7 +350,7 @@ FROM contacts
 WHERE JSON_EXTRACT(doc, '$.status') = 'active';
 ```
 
-Indexes have a maximum encoded key size of 4096 bytes. `TEXT`, `LONGTEXT`, `BLOB`, and `JSON` cannot be indexed. Equality predicates can use a complete matching hash index. Range and pattern predicates use bounded-memory table scans.
+Indexes have a maximum encoded key size of 65,535 bytes because key lengths use an unsigned 16-bit field. `TEXT`, `LONGTEXT`, `BLOB`, and `JSON` cannot be indexed. Equality predicates use a complete matching hash index. An `ORDERED` index serves `<`, `<=`, `>`, and `>=` comparisons on its leading column from an in-memory ordered map (bounded by 32 MiB, with a bounded-memory file scan fallback) and keeps equality-prefix matching on multi-column keys. Other range and pattern predicates use bounded-memory table scans.
 
 ## Wire Protocol
 
@@ -343,13 +378,36 @@ The payload contains one non-empty map. Multibyte lengths and integers use big-e
 | `7` | List | 4-byte count plus typed values |
 | `8` | Map | 4-byte count plus length-prefixed UTF-8 keys and typed values |
 
-The codec requires 64-bit PHP and limits one payload to 16 MiB, nesting to 64 levels, one container to 65,536 entries, aggregate entries to 100,000, and map keys to 1,024 bytes. Values up to the separate 1 GiB upload limit use bounded chunk frames. Empty maps are non-canonical; duplicate, empty, numeric, or invalid UTF-8 map keys are rejected. Unknown versions, kinds, flags, tags, trailing bytes, invalid checksums, and oversized declarations are fatal protocol errors.
+The codec limits one payload to 16 MiB, nesting to 64 levels, one container to 65,536 entries, aggregate entries to 100,000, and map keys to 1,024 bytes. Values up to the separate upload limit use bounded chunk frames. Empty maps are non-canonical; duplicate, empty, numeric, or invalid UTF-8 map keys are rejected. Unknown versions, kinds, flags, tags, trailing bytes, invalid checksums, oversized declarations, and integers outside the local PHP platform range are fatal protocol errors.
+
+### 32-bit Limits
+
+FoxyDB uses the same checksummed on-disk and network formats on both architectures. On 32-bit PHP, SQL `BIGINT`, row ids, auto-increment values, counters, file offsets, and configured byte limits are restricted to `PHP_INT_MIN..PHP_INT_MAX`; an existing 64-bit database containing larger values is rejected with `PLATFORM_LIMIT` instead of being truncated. Individual files must also fit the runtime's native seek and size range. Use 64-bit PHP for databases approaching 2 GiB, more than roughly 89 million row slots per table, or full signed 64-bit `BIGINT` values.
 
 Messages retain semantic `type` fields such as `hello`, `auth`, `query`, `result`, `result_start`, `row`, `result_end`, `error`, `chunk_start`, `chunk_data`, `chunk_end`, and `chunk_abort`. Query maps carry `id`, `sql`, and `params`; authentication maps carry `id`, `username`, `password`, and `interactive`. Request IDs are non-negative signed integers. The `hello.limits` map advertises `frame_payload_bytes` and `chunk_payload_bytes`; clients must use the lower of their local limits and these server limits.
 
 Command responses use one `result` frame. Row queries use `result_start`, zero or more `row` frames, and `result_end`. Large values use `$chunk` declarations followed by chunk frames. Inline binary parameters, result values, and `chunk_data.data` use tag `6` raw bytes directly, with no JSON or Base64 expansion.
 
 Every TCP connection must authenticate before sending another request.
+
+## Replication
+
+A FoxyDB daemon enabled as a source records every committed `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE DATABASE`, `DROP DATABASE`, `RENAME TABLE`, `MOVE TABLE`, and `COPY TABLE` as an idempotent canonical SQL entry in `foxydb.replication_log`. Rollback entries are discarded so a follower never sees uncommitted work.
+
+Drive replication with the bundled relay:
+
+```console
+php bin/foxydb-replicate.php \
+    --source-host=127.0.0.1 --source-port=2002 \
+    --source-user=root --source-password=secret \
+    --target-host=127.0.0.1 --target-port=2003 \
+    --target-user=root --target-password=secret \
+    --once
+```
+
+The relay reads unapplied entries via the TLS protocol, replays each canonical statement on the follower, and updates `applied` once each entry has landed. Replaying is safe to repeat: every emitted statement is keyed by primary key and uses `IF NOT EXISTS`/`IF EXISTS` clauses. The follower must connect with credentials that grant the replicated privileges on every database touched; multiple relays draw work in shared order and never violate replay ordering.
+
+Enable the journal on the source with `FOXYDB_REPLICATION=1` and prune applied entries after a retention window by setting `FOXYDB_REPLICATION_RETENTION_HOURS` (default `24`, `0` disables pruning). Each source runs a single `StorageEngine` owner; seed the follower by starting it from the same schema baseline before the first relay pass.
 
 ## Storage
 
@@ -380,11 +438,10 @@ Table and catalog locks are stored separately from removable table directories. 
 | `FOXYDB_HOST` | `127.0.0.1` | TLS TCP bind host |
 | `FOXYDB_PORT` | `2002` | TCP port |
 | `FOXYDB_DATA_DIR` | `server/data` | Persistent data directory |
-| `FOXYDB_MAX_FRAME_BYTES` | `8388608` | Initial `max_allowed_packet` value |
+| `FOXYDB_MAX_FRAME_BYTES` | `8388608` | Initial connection frame limit; `max_allowed_packet` may raise it to the protocol maximum |
 | `FOXYDB_CHUNK_BYTES` | `1048576` | Stored and transferred chunk size |
 | `FOXYDB_INLINE_VALUE_BYTES` | `65536` | Large-value chunking threshold |
 | `FOXYDB_MAX_MATERIALIZED_BYTES` | `67108864` | Initial heap and temporary-table limits |
-| `FOXYDB_MAX_RESULT_ROWS` | `1000000` | Result and mutation row bound |
 | `FOXYDB_IDLE_TIMEOUT` | `300` | Initial interactive and non-interactive idle timeout |
 | `FOXYDB_MAX_CONNECTIONS` | `256` | Connected client limit |
 | `FOXYDB_MAX_TRANSFERS` | `8` | Active transfers per client |
@@ -420,11 +477,13 @@ php tests/run.php
 
 The TCP test starts a real authenticated TLS FoxyDB child process on an available local port. It verifies certificate identity, session pinning, privilege enforcement, secure installation password rotation, and a chunked binary round trip.
 
-## Current Boundaries
+## Guarantees And Limits
 
-- There is no transaction API, join engine, grouping, subquery support, replication, or `ALTER TABLE` yet.
-- Constraint and value errors are prevalidated for multi-row inserts and updates. An operating-system or disk failure during a multi-row commit can still leave a committed prefix, with each published row individually recoverable.
-- Query execution is synchronous in one server process. Idle sockets are multiplexed, but one expensive query or slow network peer can delay other clients.
-- Hash indexes accelerate equality lookups. Ordered range indexes are not implemented.
-- Schema identifiers are ASCII and case-insensitive after normalization.
-- Privileges are exact string grants with `*` wildcards. Roles and row-level policies are not implemented.
+- Connections use a fair rotating Fiber queue. Socket I/O, result streaming, table-lock waits, and catalog-lock waits are cooperative; one `StorageEngine` owns each data directory so recovery, cache revisions, and generation publication have one authority.
+- Atomic mutations are not capped by row count. Values, constraints, policy checks, metadata format capacity, and staging memory are validated before slot publication. Recovery accepts the complete promised batch or restores every old slot; `tests/crash_consistency.php` verifies kill-and-restart behavior before, during, and after commit.
+- Identifiers are canonical lowercase UTF-8, limited to 64 code points, reject decomposed combining forms, path/control bytes, and portable-filesystem reserved names, and use the same validation for quoted and bare forms.
+- Grants, role assignments, and scoped policies bind to immutable account or role IDs. Administrative statements target fixed system objects, every joined or subquery source is authorized independently, malformed persisted grants/policies fail closed, and policies follow table rename, move, and copy operations.
+- Ordered indexes use memcomparable signed integer, finite floating-point, binary, text, and composite keys. Logs below 32 MiB use bounded in-memory maps; larger logs use versioned checksummed snapshots with checksummed blocks, strict structural validation, variable-length key ordering, and a tail that is merged again at 32 MiB.
+- Row policies compose with OR within the applicable identity set and apply before each table enters a join. SELECT, UPDATE, and DELETE filter old rows; INSERT and UPDATE validate resulting rows; policy-protected TRUNCATE is rejected. Policy definitions reject parameters and subqueries.
+- Protocol, SQL, metadata, staging-memory, cache, upload, identifier, index-key format, and platform limits are validated explicitly and fail with stable error codes rather than truncating data or returning partial results. Result row counts, atomic-batch row counts, generation numbers, and lock waits have no policy ceiling.
+- Runtime memory and timeout settings have no arbitrary upper range below the platform integer boundary. Protocol map keys, transfer identifiers, parameter occurrences, container item counts, and table columns are governed by their enclosing frame, parser-work, metadata, memory, or storage-format budgets rather than separate policy ceilings.

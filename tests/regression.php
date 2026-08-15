@@ -156,9 +156,19 @@ try {
     }
 
     $session->execute('CREATE TABLE wide_index (value VARCHAR(2000))');
+    $session->execute('CREATE INDEX idx_wide ON wide_index (value)');
+    $session->execute('CREATE TABLE format_wide_index (value VARCHAR(20000))');
     $expectError('SCHEMA_ERROR', static fn() => $session->execute(
-        'CREATE INDEX idx_wide ON wide_index (value)',
+        'CREATE INDEX idx_format_wide ON format_wide_index (value)',
     ));
+    $wideColumns = [];
+    for ($column = 0; $column < 1_025; $column++) {
+        $wideColumns[] = 'c' . $column . ' INT';
+    }
+    $session->execute('CREATE TABLE wide_schema (' . implode(', ', $wideColumns) . ')');
+    if (count($storage->table('app', 'wide_schema')->schema()['columns']) !== 1_025) {
+        throw new RuntimeException('Table schema retained the former 1024-column ceiling.');
+    }
 
     $session->execute('CREATE TABLE sequence_items (id INT PRIMARY KEY AUTO_INCREMENT, value VARCHAR(10))');
     $session->execute("INSERT INTO sequence_items (value) VALUES ('a'), ('b')");
@@ -166,7 +176,7 @@ try {
     $body = 'FXSQ' . BinaryCodec::uint32(1) . BinaryCodec::uint64(1) . BinaryCodec::uint64(1);
     FileSystem::atomicWrite(
         $sequencePath,
-        $body . BinaryCodec::uint32(BinaryCodec::crc32($body)) . "\0\0\0\0",
+        $body . BinaryCodec::crc32($body) . "\0\0\0\0",
     );
     $recoveredInsert = $session->execute("INSERT INTO sequence_items (value) VALUES ('c')");
     if ($recoveredInsert->lastInsertId !== 3) {
@@ -229,7 +239,7 @@ try {
     $boundsTable = $directory . '/databases/app/tables/journal_bounds';
     $slotBody = BinaryCodec::uint64(0) . BinaryCodec::uint32(0) . BinaryCodec::uint32(2)
         . chr(2) . "\0\0\0";
-    $deletedSlot = $slotBody . BinaryCodec::uint32(BinaryCodec::crc32($slotBody));
+    $deletedSlot = $slotBody . BinaryCodec::crc32($slotBody);
     FileSystem::writeMetadata($boundsTable . '/row.journal.fdb', [
         'generation' => 1,
         'row_id' => 2_000_000,
@@ -238,6 +248,87 @@ try {
     $expectError('STORAGE_CORRUPT', static fn() => $session->execute('SELECT * FROM journal_bounds'));
     if (filesize($boundsTable . '/g000001/rows.fdx') !== 24) {
         throw new RuntimeException('Malformed journal expanded the row slot file.');
+    }
+
+    $session->execute('CREATE TABLE atomic_items (id INT PRIMARY KEY AUTO_INCREMENT, value VARCHAR(10))');
+    $session->execute("INSERT INTO atomic_items (value) VALUES ('a'), ('b')");
+    $atomicPath = $directory . '/databases/app/tables/atomic_items';
+    $atomicFdx = $atomicPath . '/g000001/rows.fdx';
+    $activeSlot = static function (int $offset): string {
+        $body = BinaryCodec::uint64($offset) . BinaryCodec::uint32(0) . BinaryCodec::uint32(1)
+            . chr(1) . "\0\0\0";
+        return $body . BinaryCodec::crc32($body);
+    };
+    $slotThree = $activeSlot(12345);
+    $slotFour = $activeSlot(54321);
+    $slotFive = $activeSlot(99999);
+    $stream = fopen($atomicFdx, 'c+b');
+    if ($stream === false) {
+        throw new RuntimeException('Unable to open the atomic slot file.');
+    }
+    fseek($stream, (3 - 1) * 24);
+    fwrite($stream, $slotThree);
+    fseek($stream, (4 - 1) * 24);
+    fwrite($stream, $slotFour);
+    fflush($stream);
+    fclose($stream);
+    
+    // Simulate sequence advancement from the aborted 3-row insert: nextRow = 6, nextAuto = 6
+    $sequencePath = $atomicPath . '/sequence.fdb';
+    $seqBody = 'FXSQ' . BinaryCodec::uint32(1) . BinaryCodec::uint64(6) . BinaryCodec::uint64(6);
+    FileSystem::atomicWrite(
+        $sequencePath,
+        $seqBody . BinaryCodec::crc32($seqBody) . "\0\0\0\0",
+        $config->syncWrites
+    );
+
+    FileSystem::writeMetadata($atomicPath . '/row.batch.fdb', [
+        'kind' => 'batch',
+        'generation' => 1,
+        'changes' => [
+            ['row_id' => 3, 'old_slot' => null, 'new_slot' => $slotThree],
+            ['row_id' => 4, 'old_slot' => null, 'new_slot' => $slotFour],
+            ['row_id' => 5, 'old_slot' => null, 'new_slot' => $slotFive],
+        ],
+    ]);
+    $atomicRows = array_column(
+        iterator_to_array($session->execute('SELECT value FROM atomic_items ORDER BY id')->rows, false),
+        'value',
+    );
+    if ($atomicRows !== ['a', 'b']) {
+        throw new RuntimeException('An interrupted multi-row commit left a committed prefix.');
+    }
+    $atomicInsert = $session->execute("INSERT INTO atomic_items (value) VALUES ('c')");
+    if ($atomicInsert->lastInsertId !== 6) {
+        throw new RuntimeException('A rolled-back batch did not release its row identifiers.');
+    }
+    $session->execute("INSERT INTO atomic_items (value) VALUES ('x'), ('y')");
+    $atomicFdxBytes = file_get_contents($atomicFdx);
+    if ($atomicFdxBytes === false) {
+        throw new RuntimeException('Unable to read the atomic slot file.');
+    }
+    $sevenSlot = substr($atomicFdxBytes, (7 - 1) * 24, 24);
+    $eightSlot = substr($atomicFdxBytes, (8 - 1) * 24, 24);
+    FileSystem::writeMetadata($atomicPath . '/row.batch.fdb', [
+        'kind' => 'batch',
+        'generation' => 1,
+        'changes' => [
+            ['row_id' => 7, 'old_slot' => null, 'new_slot' => $sevenSlot],
+            ['row_id' => 8, 'old_slot' => null, 'new_slot' => $eightSlot],
+        ],
+    ]);
+    $keptRows = array_column(
+        iterator_to_array($session->execute('SELECT value FROM atomic_items WHERE id >= 7 ORDER BY id')->rows, false),
+        'value',
+    );
+    if ($keptRows !== ['x', 'y']) {
+        throw new RuntimeException('A fully applied batch was rolled back on recovery.');
+    }
+    $atomicTable = $storage->table('app', 'atomic_items');
+    $beforeLargeBatch = $atomicTable->countActiveRows();
+    $atomicTable->insertMany(array_fill(0, 20_001, ['value' => 'expanded']));
+    if ($atomicTable->countActiveRows() !== $beforeLargeBatch + 20_001) {
+        throw new RuntimeException('Atomic mutation did not scale beyond the former row ceiling.');
     }
 
     echo "regression: ok\n";
