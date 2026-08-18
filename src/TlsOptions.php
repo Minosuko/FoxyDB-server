@@ -13,7 +13,7 @@ final readonly class TlsOptions
     private const VERSIONS = ['TLSv1.2', 'TLSv1.3'];
 
     public function __construct(
-        public string $mode = 'REQUIRED',
+        public string $mode = 'DISABLED',
         public ?string $caFile = null,
         public ?string $caPath = null,
         public ?string $certificateFile = null,
@@ -62,7 +62,7 @@ final readonly class TlsOptions
         $versions = $options['tls-version'] ?? 'TLSv1.2,TLSv1.3';
         $versions = array_values(array_filter(array_map('trim', explode(',', (string) $versions))));
         return new self(
-            mode: strtoupper((string) ($options['ssl-mode'] ?? 'REQUIRED')),
+            mode: strtoupper((string) ($options['ssl-mode'] ?? 'DISABLED')),
             caFile: self::nullable($options['ssl-ca'] ?? null),
             caPath: self::nullable($options['ssl-capath'] ?? null),
             certificateFile: self::nullable($options['ssl-cert'] ?? null),

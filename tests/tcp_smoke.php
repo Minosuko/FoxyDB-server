@@ -37,6 +37,7 @@ $serverEnvironment = getenv();
 if (!is_array($serverEnvironment)) {
     $serverEnvironment = [];
 }
+$serverEnvironment['FOXYDB_TLS'] = 'true';
 $process = proc_open(
     $command,
     $descriptors,
@@ -57,7 +58,14 @@ try {
     $deadline = microtime(true) + 10;
     while (microtime(true) < $deadline) {
         try {
-            $client = Client::connect('127.0.0.1', $port, 'root', 'root', 1.0);
+            $client = Client::connect(
+                '127.0.0.1',
+                $port,
+                'root',
+                'root',
+                1.0,
+                tlsOptions: new TlsOptions(mode: 'REQUIRED'),
+            );
             break;
         } catch (FoxyException) {
             usleep(100_000);
@@ -97,7 +105,7 @@ try {
         username: 'root',
         password: 'root',
         timeoutSeconds: 2.0,
-        tlsOptions: new TlsOptions(tlsVersions: ['TLSv1.2']),
+        tlsOptions: new TlsOptions(mode: 'REQUIRED', tlsVersions: ['TLSv1.2']),
     );
     if (($tls12Client->tlsInfo()['protocol'] ?? null) !== 'TLSv1.2') {
         throw new RuntimeException('TLS version policy was not enforced.');
@@ -111,6 +119,7 @@ try {
             username: 'root',
             password: 'root',
             timeoutSeconds: 3.0,
+            tlsOptions: new TlsOptions(mode: 'REQUIRED'),
         );
     }
     foreach ($connectionPool as $pooledClient) {
@@ -150,7 +159,14 @@ try {
         }
     }
     try {
-        Client::connect('127.0.0.1', $port, 'root', 'wrong-password', 1.0);
+        Client::connect(
+            '127.0.0.1',
+            $port,
+            'root',
+            'wrong-password',
+            1.0,
+            tlsOptions: new TlsOptions(mode: 'REQUIRED'),
+        );
         throw new RuntimeException('Invalid credentials were accepted.');
     } catch (FoxyException $exception) {
         if ($exception->errorCode !== 'AUTH_FAILED') {
@@ -201,7 +217,14 @@ try {
     if (!$client->ping()) {
         throw new RuntimeException('TCP ping failed.');
     }
-    $packetClient = Client::connect('127.0.0.1', $port, 'root', 'root', 1.0);
+    $packetClient = Client::connect(
+        '127.0.0.1',
+        $port,
+        'root',
+        'root',
+        1.0,
+        tlsOptions: new TlsOptions(mode: 'REQUIRED'),
+    );
     $packetClient->query('SET SESSION max_allowed_packet = 1024');
     try {
         $packetClient->query('SELECT username FROM users_schema WHERE username = ?', [str_repeat('p', 2_000)]);
@@ -213,7 +236,14 @@ try {
             throw $exception;
         }
     }
-    $timeoutClient = Client::connect('127.0.0.1', $port, 'root', 'root', 1.0);
+    $timeoutClient = Client::connect(
+        '127.0.0.1',
+        $port,
+        'root',
+        'root',
+        1.0,
+        tlsOptions: new TlsOptions(mode: 'REQUIRED'),
+    );
     $timeoutClient->query('SET SESSION wait_timeout = 1');
     sleep(3);
     try {
@@ -271,6 +301,7 @@ try {
         password: 'root',
         timeoutSeconds: 2.0,
         uploadChunkBytes: 65_536,
+        tlsOptions: new TlsOptions(mode: 'REQUIRED'),
     );
     $adaptiveClient->query('SET SESSION max_allowed_packet = 1024');
     $adaptiveClient->uploadFile($uploadPath, 'binary');
@@ -293,7 +324,14 @@ try {
     if ($numericInsert->lastInsertId !== 2 || !$client->ping()) {
         throw new RuntimeException('Numeric transfer identifier cleanup damaged the connection.');
     }
-    $orphanClient = Client::connect('127.0.0.1', $port, 'root', 'root', 1.0);
+    $orphanClient = Client::connect(
+        '127.0.0.1',
+        $port,
+        'root',
+        'root',
+        1.0,
+        tlsOptions: new TlsOptions(mode: 'REQUIRED'),
+    );
     $orphanClient->uploadFile($uploadPath, 'binary', '-1');
     $orphanClient->close();
     usleep(100_000);
@@ -329,7 +367,14 @@ try {
         'INSERT INTO overflow_rows (value) VALUES ' . implode(', ', $values),
         $overflowParameters,
     );
-    $limitClient = Client::connect('127.0.0.1', $port, 'root', 'root', 1.0);
+    $limitClient = Client::connect(
+        '127.0.0.1',
+        $port,
+        'root',
+        'root',
+        1.0,
+        tlsOptions: new TlsOptions(mode: 'REQUIRED'),
+    );
     $limitClient->query('USE network');
     $overflowResult = $limitClient->query('SELECT id, value FROM overflow_rows');
     if (count(iterator_to_array($overflowResult->rows, false)) !== 11) {
@@ -350,7 +395,14 @@ try {
         . "VALUES ('reader', ?, 'network', '*', 'CONNECT'), ('reader', ?, 'network', 'files', 'SELECT')",
         [$readerAccount, $readerAccount],
     );
-    $reader = Client::connect('127.0.0.1', $port, 'reader', 'reader-pass', 1.0);
+    $reader = Client::connect(
+        '127.0.0.1',
+        $port,
+        'reader',
+        'reader-pass',
+        1.0,
+        tlsOptions: new TlsOptions(mode: 'REQUIRED'),
+    );
     $reader->query('USE network');
     $readerRows = iterator_to_array($reader->query('SELECT name FROM files')->rows, false);
     if (array_column($readerRows, 'name') !== ['payload', 'numeric-transfer', 'inline']) {
@@ -409,14 +461,28 @@ try {
     $generatedRootPassword = $match[1];
     $client->close();
     try {
-        Client::connect('127.0.0.1', $port, 'root', 'root', 1.0);
+        Client::connect(
+            '127.0.0.1',
+            $port,
+            'root',
+            'root',
+            1.0,
+            tlsOptions: new TlsOptions(mode: 'REQUIRED'),
+        );
         throw new RuntimeException('Secure installation left the default root password active.');
     } catch (FoxyException $exception) {
         if ($exception->errorCode !== 'AUTH_FAILED') {
             throw $exception;
         }
     }
-    $securedClient = Client::connect('127.0.0.1', $port, 'root', $generatedRootPassword, 2.0);
+    $securedClient = Client::connect(
+        '127.0.0.1',
+        $port,
+        'root',
+        $generatedRootPassword,
+        2.0,
+        tlsOptions: new TlsOptions(mode: 'REQUIRED'),
+    );
     $secureMarker = $securedClient->query(
         "SELECT variable_value FROM sys_config WHERE variable_name = 'secure_installation_completed'",
     );

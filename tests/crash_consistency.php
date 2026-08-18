@@ -34,12 +34,6 @@ $name = stream_socket_get_name($listener, false);
 fclose($listener);
 $port = (int) substr(strrchr($name, ':'), 1);
 
-$context = stream_context_create(['ssl' => [
-    'verify_peer' => false,
-    'verify_peer_name' => false,
-    'allow_self_signed' => true,
-]]);
-
 $failures = [];
 $process = null;
 $pipes = [];
@@ -88,17 +82,16 @@ $stopServer = static function () use (&$process, &$pipes): void {
     $pipes = [];
 };
 
-$connectClient = static function (float $timeout) use ($context, $port): mixed {
+$connectClient = static function (float $timeout) use ($port): mixed {
     $socket = false;
     $lastError = '';
     for ($attempt = 0; $attempt < 100 && $socket === false; $attempt++) {
         $socket = @stream_socket_client(
-            "tls://127.0.0.1:{$port}",
+            "tcp://127.0.0.1:{$port}",
             $errorCodeA,
             $errorMessageA,
             $timeout,
             STREAM_CLIENT_CONNECT,
-            $context,
         );
         if ($socket === false) {
             $lastError = $errorMessageA;

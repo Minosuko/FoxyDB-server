@@ -63,12 +63,7 @@ try {
     }
     $insertMs = (int) ((microtime(true) - $insertStarted) * 1000);
 
-    $context = stream_context_create(['ssl' => [
-        'verify_peer' => false,
-        'verify_peer_name' => false,
-        'allow_self_signed' => true,
-    ]]);
-    $slow = stream_socket_client("tls://127.0.0.1:{$port}", $socketErrorCode, $socketErrorMessage, 3.0, STREAM_CLIENT_CONNECT, $context);
+    $slow = stream_socket_client("tcp://127.0.0.1:{$port}", $socketErrorCode, $socketErrorMessage, 3.0);
     if ($slow === false) {
         throw new RuntimeException("Unable to open the slow query connection: {$socketErrorMessage}");
     }

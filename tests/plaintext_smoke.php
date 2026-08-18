@@ -83,11 +83,11 @@ try {
     }
     $preferred->close();
 
-    try {
-        Client::connect('127.0.0.1', $port, 'root', 'root', 1.0);
-        throw new RuntimeException('TLS-required client connected to a plaintext endpoint.');
-    } catch (FoxyException) {
+    $default = Client::connect('127.0.0.1', $port, 'root', 'root', 1.0);
+    if ($default->tlsInfo() !== [] || !$default->ping()) {
+        throw new RuntimeException('Default client did not connect over plaintext.');
     }
+    $default->close();
     if (is_file($directory . '/tls/server.crt')) {
         throw new RuntimeException('Plaintext mode generated an unnecessary TLS certificate.');
     }

@@ -36,7 +36,7 @@ final readonly class Config
         public int $maxQueuedQueriesPerClient = 8,
         public bool $replicationEnabled = false,
         public int $replicationRetentionHours = 24,
-        public bool $tlsEnabled = true,
+        public bool $tlsEnabled = false,
     ) {
         if ($port < 1 || $port > 65_535) {
             throw new FoxyException('Port must be between 1 and 65535.', 'INVALID_CONFIG');
@@ -94,7 +94,7 @@ final readonly class Config
             maxQueuedQueriesPerClient: self::envInt('FOXYDB_MAX_QUEUED_QUERIES', 8),
             replicationEnabled: self::envBool('FOXYDB_REPLICATION', false),
             replicationRetentionHours: self::envInt('FOXYDB_REPLICATION_RETENTION_HOURS', 24),
-            tlsEnabled: self::envBool('FOXYDB_TLS', self::iniBool($ini['tls'] ?? null, true)),
+            tlsEnabled: self::envBool('FOXYDB_TLS', self::iniBool($ini['tls'] ?? null, false)),
         );
     }
 

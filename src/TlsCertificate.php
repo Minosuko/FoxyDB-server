@@ -72,9 +72,10 @@ final readonly class TlsCertificate
         }
         $details = openssl_x509_parse($certificate);
         $expires = null;
-        if (is_array($details) && is_string($details['validTo'] ?? null)) {
+        if (is_array($details) && is_int($details['validTo_time_t'] ?? null)) {
             try {
-                $expires = new \DateTimeImmutable($details['validTo'], new \DateTimeZone('UTC'));
+                $expires = (new \DateTimeImmutable('@' . $details['validTo_time_t']))
+                    ->setTimezone(new \DateTimeZone('UTC'));
             } catch (\Throwable) {
             }
         }
